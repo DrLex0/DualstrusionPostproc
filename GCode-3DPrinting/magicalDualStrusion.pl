@@ -7,9 +7,17 @@ my $nozzleDistance = 34;
 # The distance between the center of the priming tower (which has a radius of 6mm), and the nearest coordinate that occurs in the print. This should be at least 10 mm.
 my $squareMargin = 12;
 
+# Number of degrees Celsius to lower the inactive extruder's temperature.
+# How much is needed, depends on your material and favourite printing temperatures.
+# It should be the smallest possible drop that stops the oozing.
+# This is highly recommended because not doing this will cause ooze to be spread all around your print.
+# Still, if you want to disable it, set it to 0.
+my $temperatureDrop = 50;
+
 # Optional time to let the nozzles sit idle in between the tool change and priming the active nozzle.
-# Set to 0 to disable.
-my $dwell = 5;
+# Set to 0 to disable. This should be unnecessary when using $temperatureDrop although it can be used
+# to give the inactive nozzle extra time to cool down.
+my $dwell = 0;
 
 # Number of perimeters to print while printing a non-priming layer of the priming tower.
 # 2 perimeters should be sufficient. Set to 0 to print a full layer.
@@ -28,11 +36,18 @@ my @filament_diameters = (1.75, 1.75);
 my @nozzle_diameters = (0.4, 0.4);
 my @extrusion_multipliers = (1.0, 1.0);
 
+# It is extremely important that these values can be parsed from the file. The script will simply
+# bail out if it doesn't find them.
+my @toolTemperature;
+my @toolTemperatureL1;
+
 # I might also want to override some of these with values from the file, but these should be sensible values for all cases.
 my $travelFeedRate = 8400;
 my $retractFeedRate = 1800;
 my $wipeFeedRate = 4000;
 my $layer1FeedRate = 1200;
+# Feedrates for the inner and outer perimeters of the tower respectively. You could tweak the outer rate
+# to more closely match the normal print rate so there won't be a huge pressure difference when the print resumes.
 my $innerFeedRate = 1200;
 my $outerFeedRate = 1200;
 
@@ -70,7 +85,7 @@ my @squareLayer1Coords = (
 [[9.600, 10.100, 35.15520], [-9.600, 10.100, 36.24550], [-9.600, -9.100, 37.33580], [9.540, -9.100, 38.42269]]
 );
 
-# Coordinates were generated for a 0.2mm layer, with a 0.4mm nozzle, printing 1.75mm filament at 22mm/s, 0.6mm width.
+# Coordinates were generated for a 0.2mm layer, with a 0.4mm nozzle, printing 1.75mm filament at 20mm/s, 0.6mm width.
 my @squareTravels = (
 [-3.043, -2.543],
 [-3.600, -3.100],
@@ -114,26 +129,38 @@ my ($squareX, $squareY) = (($minX + $maxX)/2, $maxY + $squareMargin);
 # Scale factor = layer_height/0.2 * filament_diameter/1.75 * nozzle_diameter/0.4 * extrusion_multiplier
 # Layer 1 SF = first_layer_height/0.25 * filament_diameter/1.75 * nozzle_diameter/0.4 * extrusion_multiplier
 
+if(!@layerHeights) {
+	print STDERR "This file has no printable content!\n";
+	exit(1);
+}
+
 # Preprocess the code blocks: wipe any retract command or irrelevant junk (comments, whitespace) at
 # the very end, because we'll be replacing these with our own retracts. (Moreover, Slic3r first
 # changes layer and then retracts, so there will be blocks that only have a retract in them.)
+my $lastLayerZ = $layerHeights[-1];
 foreach my $layerZ (@layerHeights) {
 	foreach my $key ("0_${layerZ}", "1_${layerZ}") {
 		my $blockListRef = $toolLayers{$key};
-		if($blockListRef) {
-			my @cleanedBlocks;
-			foreach my $blockRef (@{$blockListRef}) {
-				while(@{$blockRef} && $$blockRef[-1] =~ /^(G1 E\S+ |\s*;|\s*$)/) {
-					pop(@{$blockRef});  # zap final retract, empty lines, and comment junk
-				}
-				push(@cleanedBlocks, $blockRef) if(@{$blockRef});
+		next if(!$blockListRef);
+		
+		my @cleanedBlocks;
+		foreach my $blockRef (@{$blockListRef}) {
+			while(@{$blockRef} && $$blockRef[-1] =~ /^(G1 E\S+ |\s*;|\s*$)/) {
+				pop(@{$blockRef});  # zap final retract, empty lines, and comment junk
 			}
-			if(@cleanedBlocks) {
-				$toolLayers{$key} = \@cleanedBlocks;
+			push(@cleanedBlocks, $blockRef) if(@{$blockRef});
+		}
+		if(@cleanedBlocks) {
+			# Strip any M127 command from the very last code block so it won't disable the fan
+			# if the ordering changes and the final layer of the other material is yet to be
+			# printed. The end G-code or the printer will disable the fan anyway.
+			if($layerZ == $lastLayerZ) {
+				pop(@{$cleanedBlocks[-1]}) if(${$cleanedBlocks[-1]}[-1] =~ /^M127($|\s|;)/);
 			}
-			else {
-				delete $toolLayers{$key};
-			}
+			$toolLayers{$key} = \@cleanedBlocks;
+		}
+		else {
+			delete $toolLayers{$key};
 		}
 	}
 }
@@ -145,6 +172,7 @@ my $activeTool = 0;
 my @originalE = (0, 0);  # How much was extruded by the original file at the current input line.
 my @offsetE   = (0, 0);  # The offset we're adding, i.e. how much extra filament my extra code has pushed out
 my @retracted = (0, -1);  # How far the extruders are currently retracted (regardless of done by the original code, or mine). These values can only be negative or 0. Mind that we assume that T1 starts out retracted, this should be valid when using my start G-code and considering the way Slic3r handles dualstrusion.
+my $fanEnabled = 0;  # The fan should not be enabled during tool change and priming.
 
 # Reassemble the file in optimal order and insert retractions and priming code where necessary.
 # For every layer:
@@ -306,6 +334,12 @@ sub parseInputFile
 			elsif($line =~ /^; retract_length_toolchange = (.*)/ ) {
 				@retractLenTC = split(/,/, $1);
 			}
+			elsif($line =~ /^; first_layer_temperature = (.*)/ ) {
+				@toolTemperatureL1 = split(/,/, $1);
+			}
+			elsif($line =~ /^; temperature = (.*)/ ) {
+				@toolTemperature = split(/,/, $1);
+			}
 			next;
 		}
 
@@ -357,6 +391,10 @@ sub parseInputFile
 	}
 	if(!($layerHeightOK && $firstLayerHOK && $filaDiamOK && $nozzleDiamOK && $extruMultiOK)) {
 		print STDERR "WARNING: not all extrusion parameters could be parsed from the file.\nExtrusion values may be wrong. Check the input file!\n";
+	}
+	if(!@toolTemperature || $#toolTemperature < 1 || !@toolTemperatureL1 || $#toolTemperatureL1 < 1) {
+		print STDERR "FATAL: could not find 'temperature' and/or 'first_layer_temperature' values in the file, these are essential to avoid utter and complete b0rk.\n";
+		exit(1);
 	}
 	
 	return ($minX, $minY, $maxX, $maxY, $highestToolChange);
@@ -440,6 +478,7 @@ sub outputTransformedCode
 # output file.
 {
 	my $codeRef = shift;
+	my $inactiveTool = ($activeTool == 0 ? 1 : 0);
 
 	foreach my $line (@{$codeRef}) {
 		if($line =~ /^G1 X(\S+) Y(\S+) E(\S+)($|;.*|\s.*)/) {
@@ -486,7 +525,21 @@ sub outputTransformedCode
 			$retracted[$activeTool] = 0 if($retracted[$activeTool] > 0);
 			push(@output, sprintf('G1 E%.5f %s', $e + $offsetE[$activeTool], $extra)) if($move);
 		}
+		elsif($line =~ /^M104 S\S+ T${inactiveTool}/) {
+			# Temperature change. Must be disabled for inactive tool.
+			push(@output, ";$line ; DISABLED: keep the inactive tool cool!");
+		}
+		elsif($line =~ /^M108 T/) {
+			# Drop these to avoid any confusion, our own tool change code will insert this where appropriate
+			next;
+		}
 		else {  # Anything else
+			if($line =~ /^M126($|\s|;)/) {
+				$fanEnabled = 1;
+			}
+			elsif($line =~ /^M127($|\s|;)/) {
+				$fanEnabled = 0;
+			}
 			push(@output, $line);
 		}
 	}
@@ -496,21 +549,34 @@ sub outputToolChangeAndPrime
 # Appends commands to @output to perform the tool change and prime the new nozzle.
 {
 	my $isLayer1 = shift;
+	my $nextTool = ($activeTool == 0 ? 1 : 0);
 
 	push(@output, '; - - - - - START TOOL CHANGE AND PRIME NOZZLE - - - - -');
+	push(@output, 'M127; disable fan') if($fanEnabled);
+	# Drop the temperature of this nozzle and raise the other
+	if($temperatureDrop) {
+		push(@output, sprintf('M104 S%d T%d ; drop temperature to inhibit oozing',
+		                      $toolTemperature[$activeTool] - $temperatureDrop, $activeTool));
+	}
+	my $newTemperature = $isLayer1 ? $toolTemperatureL1[$nextTool] : $toolTemperature[$nextTool];
+	push(@output, "M104 S${newTemperature} T${nextTool} ; heat active nozzle");
 	# Move to the tower
 	push(@output, sprintf('G1 X%.3f Y%.3f F%d', $squareX, $squareY, $travelFeedRate));
 	# Do the tool swap. Use workaround to do the move at a reasonable speed, because it is not accelerated.
 	# TODO: I could parse the original tool change code from the file and fill in the template.
-	$activeTool = ($activeTool == 0 ? 1 : 0);
-	push(@output, ('G1 F5000; speed for tool change.', "T${activeTool}; do actual tool swap", 'G4 P0; flush pipeline'));
+	$activeTool = $nextTool;
+	# I have found the M108 command to be utterly irrelevant for the FFCP, but I insert it anyway
+	# in case other tools rely on it to know the tool has changed.
+	push(@output, ('G1 F5000; speed for tool change.',
+	               "T${activeTool}; do actual tool swap",
+	               "M108 T${activeTool}",
+	               'G4 P0; flush pipeline'));
+	push(@output, "M6 T${activeTool} ; wait for extruder to heat up");
 	push(@output, 'G4 P'. int(1000 * $dwell) .' ; wait') if($dwell);
-
-	# Unretract from any last tool change retraction
-	my $extrusionScale = ($isLayer1 ? $extruScaleL1[$activeTool] : $extruScale[$activeTool]);
 
 	# Print a full tower layer to prime the nozzle.
 	push(@output, '; Print priming tower (full)');
+	my $extrusionScale = ($isLayer1 ? $extruScaleL1[$activeTool] : $extruScale[$activeTool]);
 	$offsetE[$activeTool] +=
 		generateSquare($squareX, $squareY,
 		               $originalE[$activeTool] + $offsetE[$activeTool],
@@ -522,6 +588,7 @@ sub outputToolChangeAndPrime
 	my $move = $nozzleDistance;
 	$move *= -1 if($activeTool == 1);
 	push(@output, sprintf('G1 X%.3f Y%.3f F%d ; wipe nozzle on tower', $squareX + $move, $squareY, $wipeFeedRate));
+	push(@output, 'M126; re-enable fan') if($fanEnabled);
 	push(@output, '; - - - - - END TOOL CHANGE AND PRIME NOZZLE - - - - -');
 }
 
