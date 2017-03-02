@@ -1,22 +1,23 @@
 #!/usr/bin/perl -w
 use strict;
 
-# This should be 34 for the FFCP
+# This should be 34 for the FFCP unless you hacked it big time.
 my $nozzleDistance = 34;
 
-# The distance between the center of the priming tower (which has a radius of 6mm), and the nearest coordinate that occurs in the print. This should be at least 10 mm.
+# The distance between the center of the priming tower, and the nearest coordinate that occurs in
+# the print. This should be at least 10 mm, the radius of the first layer of the tower.
 my $squareMargin = 12;
 
-# Number of degrees Celsius to lower the inactive extruder's temperature.
-# How much is needed, depends on your material and favourite printing temperatures.
-# It should be the smallest possible drop that stops the oozing.
-# This is highly recommended because not doing this will cause ooze to be spread all around your print.
+# Number of degrees Celsius to lower the inactive extruder's temperature. How much is needed,
+# depends on your material and favourite printing temperatures, but 50 is probably a good value.
+# It should be the smallest possible drop that stops the oozing. This is highly recommended because
+# without this, ooze will be sprinkled all around your print.
 # Still, if you want to disable it, set it to 0.
 my $temperatureDrop = 50;
 
 # Optional time to let the nozzles sit idle in between the tool change and priming the active nozzle.
-# Set to 0 to disable. This should be unnecessary when using $temperatureDrop although it can be used
-# to give the inactive nozzle extra time to cool down.
+# Set to 0 to disable. It can be used to give the inactive nozzle extra time to cool down, but it
+# may be better to wipe the nozzle while it has not yet completely cooled down anyway.
 my $dwell = 0;
 
 # Number of perimeters to print while printing a non-priming layer of the priming tower.
@@ -87,8 +88,6 @@ my @squareLayer1Coords = (
 
 # Coordinates were generated for a 0.2mm layer, with a 0.4mm nozzle, printing 1.75mm filament at 20mm/s, 0.6mm width.
 my @squareTravels = (
-[-3.043, -2.543],
-[-3.600, -3.100],
 [-4.158, -3.658],
 [-4.715, -4.215],
 [-5.272, -4.772],
@@ -98,15 +97,13 @@ my @squareTravels = (
 [-7.500, -7.000]
 );
 my @squareCoords = (
-[[3.043, -2.543, 0.28194], [3.043, 3.543, 0.56389], [-3.043, 3.543, 0.84584], [-3.043, -2.483, 1.12500]],
-[[3.600, -3.100, 1.45856], [3.600, 4.100, 1.79211], [-3.600, 4.100, 2.12567], [-3.600, -3.040, 2.45644]],
-[[4.158, -3.658, 2.84161], [4.158, 4.658, 3.22677], [-4.158, 4.658, 3.61194], [-4.158, -3.598, 3.99432]],
-[[4.715, -4.215, 4.43109], [4.715, 5.215, 4.86787], [-4.715, 5.215, 5.30464], [-4.715, -4.155, 5.73864]],
-[[5.272, -4.772, 6.22702], [5.272, 5.772, 6.71540], [-5.272, 5.772, 7.20378], [-5.272, -4.712, 7.68939]],
-[[5.829, -5.329, 8.22938], [5.829, 6.329, 8.76937], [-5.829, 6.329, 9.30936], [-5.829, -5.269, 9.84658]],
-[[6.386, -5.886, 10.43818], [6.386, 6.886, 11.02978], [-6.386, 6.886, 11.62138], [-6.386, -5.826, 12.21020]],
-[[6.943, -6.443, 12.85341], [6.943, 7.443, 13.49663], [-6.943, 7.443, 14.13984], [-6.943, -6.383, 14.78027]],
-[[7.500, -7.000, 15.47509], [7.500, 8.000, 16.16991], [-7.500, 8.000, 16.86473], [-7.500, -6.940, 17.55677]]
+[[4.158, -3.658, 0.38517], [4.158, 4.658, 0.77033], [-4.158, 4.658, 1.15550], [-4.158, -3.598, 1.53788]],
+[[4.715, -4.215, 1.97465], [4.715, 5.215, 2.41143], [-4.715, 5.215, 2.84820], [-4.715, -4.155, 3.28220]],
+[[5.272, -4.772, 3.77058], [5.272, 5.772, 4.25896], [-5.272, 5.772, 4.74734], [-5.272, -4.712, 5.23295]],
+[[5.829, -5.329, 5.77294], [5.829, 6.329, 6.31293], [-5.829, 6.329, 6.85292], [-5.829, -5.269, 7.39014]],
+[[6.386, -5.886, 7.98174], [6.386, 6.886, 8.57334], [-6.386, 6.886, 9.16494], [-6.386, -5.826, 9.75376]],
+[[6.943, -6.443, 10.39697], [6.943, 7.443, 11.04019], [-6.943, 7.443, 11.68340], [-6.943, -6.383, 12.32383]],
+[[7.500, -7.000, 13.01865], [7.500, 8.000, 13.71347], [-7.500, 8.000, 14.40829], [-7.500, -6.940, 15.10033]]
 );
 
 
@@ -552,7 +549,6 @@ sub outputToolChangeAndPrime
 	my $nextTool = ($activeTool == 0 ? 1 : 0);
 
 	push(@output, '; - - - - - START TOOL CHANGE AND PRIME NOZZLE - - - - -');
-	push(@output, 'M127; disable fan') if($fanEnabled);
 	# Drop the temperature of this nozzle and raise the other
 	if($temperatureDrop) {
 		push(@output, sprintf('M104 S%d T%d ; drop temperature to inhibit oozing',
@@ -571,6 +567,10 @@ sub outputToolChangeAndPrime
 	               "T${activeTool}; do actual tool swap",
 	               "M108 T${activeTool}",
 	               'G4 P0; flush pipeline'));
+	# Only disable the fan now, because Sailfish has the stupid habit of anticipating this command
+	# for several seconds and possibly already disabling the fan while we might still be printing
+	# a difficult overhang.
+	push(@output, 'M127; disable fan') if($fanEnabled);
 	push(@output, "M6 T${activeTool} ; wait for extruder to heat up");
 	push(@output, 'G4 P'. int(1000 * $dwell) .' ; wait') if($dwell);
 
@@ -585,10 +585,12 @@ sub outputToolChangeAndPrime
 	push(@output, doRetractMove(-$retractLen[$activeTool]) .' ; normal retract');
 	# Wipe the ooze from the deactivated nozzle
 	push(@output, sprintf('G1 X%.3f Y%.3f F%d', $squareX, $squareY, $travelFeedRate));
+	# Again, the fan would enable way earlier than I would like it to, therefore block it with a
+	# pipeline flush. Enable the fan before the wipe move, so it has some time to spin up.
+	push(@output, ('G4 P0', 'M126; re-enable fan')) if($fanEnabled);
 	my $move = $nozzleDistance;
 	$move *= -1 if($activeTool == 1);
 	push(@output, sprintf('G1 X%.3f Y%.3f F%d ; wipe nozzle on tower', $squareX + $move, $squareY, $wipeFeedRate));
-	push(@output, 'M126; re-enable fan') if($fanEnabled);
 	push(@output, '; - - - - - END TOOL CHANGE AND PRIME NOZZLE - - - - -');
 }
 
@@ -602,7 +604,8 @@ sub outputTopUpPrimingTower
 	# Don't move to the tower center, the tower code will make the travel move directly to the starting point.
 	my $extrusionScale = ($isLayer1 ? $extruScaleL1[$activeTool] : $extruScale[$activeTool]);
 
-	# Print a minimal tower layer to ensure continuity of the tower.
+	# Print a minimal tower layer to ensure continuity of the tower (unless this is the first
+	# layer, then we want a solid base)
 	my $how = $isLayer1 ? 'full' : 'hollow';
 	push(@output, "; Print priming tower (${how})");
 	my $maxPerim = $isLayer1 ? 0 : $towerMaintainPerimeters;
