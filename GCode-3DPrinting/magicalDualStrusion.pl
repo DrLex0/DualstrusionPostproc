@@ -1,4 +1,25 @@
 #!/usr/bin/perl -w
+# Dualstrusion post-processing script for Slic3r output and a Replicator Dual-like printer.
+# Version: 0.1
+# Alexander Thomas a.k.a. DrLex, https://www.dr-lex.be/
+# Released under Creative Commons Attribution 4.0 International license.
+#
+# Features:
+# * Minimise the number of tool changes.
+# * Prime nozzle after tool change on a priming tower.
+# * Cool down the unused nozzle. (Do not try to use the ooze prevention temperature drop in Slic3r!
+#     Last time I tried it, it was a bucket of bugs. It didn't even wait for the temperature to
+#     settle.)
+# * Wipe inactive nozzle on tower before resuming print.
+# * Maintain tower with minimal perimeters when no tool change.
+# * Disable fan during heating and priming.
+#
+# It is recommended to enable a tall skirt because the wipe is not always perfect, and the
+# active nozzle will ooze during the travel move from the tower to the print.
+#
+# This script assumes you are using the custom G-code I published at
+#    https://www.dr-lex.be/info-stuff/print3d-ffcp.html#slice_gcode
+
 use strict;
 
 # This should be 34 for the FFCP unless you hacked it big time.
@@ -11,8 +32,8 @@ my $squareMargin = 12;
 # Number of degrees Celsius to lower the inactive extruder's temperature. How much is needed,
 # depends on your material and favourite printing temperatures, but 50 is probably a good value.
 # It should be the smallest possible drop that stops the oozing. This is highly recommended because
-# without this, ooze will be sprinkled all around your print.
-# Still, if you want to disable it, set it to 0.
+# without this, ooze will be sprinkled all across your print.
+# Still, if you want to disable it for a quick & literally dirty print, set it to 0.
 my $temperatureDrop = 50;
 
 # Optional time to let the nozzles sit idle in between the tool change and priming the active nozzle.
@@ -21,9 +42,11 @@ my $temperatureDrop = 50;
 my $dwell = 0;
 
 # Number of perimeters to print while printing a non-priming layer of the priming tower.
-# 2 perimeters should be sufficient. Set to 0 to print a full layer.
+# Two perimeters should be sufficient. Set to 0 to always print a full layer.
 my $towerMaintainPerimeters = 2;
 
+# Enable debug output
+my $debug = 1;
 
 # These values will be overridden with those found in the file.
 my @retractLen = (1, 1);
@@ -42,13 +65,15 @@ my @extrusion_multipliers = (1.0, 1.0);
 my @toolTemperature;
 my @toolTemperatureL1;
 
-# I might also want to override some of these with values from the file, but these should be sensible values for all cases.
+# I might also want to override some of these with values from the file, but these should be
+# sensible values for all cases.
 my $travelFeedRate = 8400;
 my $retractFeedRate = 1800;
 my $wipeFeedRate = 4000;
 my $layer1FeedRate = 1200;
-# Feedrates for the inner and outer perimeters of the tower respectively. You could tweak the outer rate
-# to more closely match the normal print rate so there won't be a huge pressure difference when the print resumes.
+# Feedrates for the inner and outer perimeters of the tower respectively. You could tweak the outer
+# rate to more closely match the normal print rate so there won't be a huge pressure difference
+# when the print resumes.
 my $innerFeedRate = 1200;
 my $outerFeedRate = 1200;
 
@@ -69,6 +94,7 @@ my @squareLayer1Travels = (
 [9.054, -8.554],
 [9.600, -9.100]
 );
+# This is a 20mm square, with a 5mm hole in the middle.
 my @squareLayer1Coords = (
 [[2.497, 2.997, 0.28364], [-2.497, 2.997, 0.56729], [-2.497, -1.997, 0.85093], [2.437, -1.997, 1.13117]],
 [[3.044, 3.544, 1.47686], [-3.044, 3.544, 1.82256], [-3.044, -2.544, 2.16825], [2.984, -2.544, 2.51054]],
@@ -96,6 +122,7 @@ my @squareTravels = (
 [-6.943, -6.443],
 [-7.500, -7.000]
 );
+# This is a 15mm square square, with a 8mm hole in the middle.
 my @squareCoords = (
 [[4.158, -3.658, 0.38517], [4.158, 4.658, 0.77033], [-4.158, 4.658, 1.15550], [-4.158, -3.598, 1.53788]],
 [[4.715, -4.215, 1.97465], [4.715, 5.215, 2.41143], [-4.715, 5.215, 2.84820], [-4.715, -4.155, 3.28220]],
@@ -118,9 +145,11 @@ my (@header, @footer, @layerHeights);
 my %toolLayers;
 
 my ($minX, $minY, $maxX, $maxY, $highestToolChange) = parseInputFile($inFile, \@header, \@footer, \%toolLayers, \@layerHeights);
-print STDERR "Found XY bounds as ${minX}~${maxX}, ${minY}~${maxY}\n"; #DEBUG
-print STDERR "Normal extrusion scale factors:  $extruScale[0], $extruScale[1]\n"; #DEBUG
-print STDERR "Layer 1 extrusion scale factors: $extruScaleL1[0], $extruScaleL1[1]\n"; #DEBUG
+if($debug) {
+	print STDERR "Found XY bounds as ${minX}~${maxX}, ${minY}~${maxY}\n";
+	print STDERR "Normal extrusion scale factors:  $extruScale[0], $extruScale[1]\n";
+	print STDERR "Layer 1 extrusion scale factors: $extruScaleL1[0], $extruScaleL1[1]\n";
+}
 my ($squareX, $squareY) = (($minX + $maxX)/2, $maxY + $squareMargin);
 
 # Scale factor = layer_height/0.2 * filament_diameter/1.75 * nozzle_diameter/0.4 * extrusion_multiplier
@@ -164,7 +193,7 @@ foreach my $layerZ (@layerHeights) {
 
 # Assumption: we always start with T0 and always print a skirt on layer 1.
 # Even if there is no T0 material in the first layer, Slic3r will print a skirt with T0 and then swap tools.
-# If this ever changes or someone deems a skirt unnecessary, this script will break.
+# If this ever changes or the user deems a skirt unnecessary, this script might break.
 my $activeTool = 0;
 my @originalE = (0, 0);  # How much was extruded by the original file at the current input line.
 my @offsetE   = (0, 0);  # The offset we're adding, i.e. how much extra filament my extra code has pushed out
@@ -185,7 +214,7 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 	my $layerZ = $layerHeights[$layerId];
 	my $nextLayerZ = ($layerId < $#layerHeights ? $layerHeights[$layerId + 1] : 0);
 
-	print STDERR "LAYER ${layerId}: ${layerZ}\n"; #DEBUG
+	print STDERR "LAYER ${layerId}: ${layerZ}\n" if($debug);
 	# Check what tools are active in this layer and the next.
 	my (@activeToolBlocks, @otherToolBlocks);
 	my $otherTool = ($activeTool == 0 ? 1 : 0);
@@ -206,7 +235,7 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 	push(@output, doRetractMove(-$retractLen[$activeTool]) .' ; normal retract') unless($retracted[$activeTool]);
 	push(@output, sprintf('G1 Z%.3f F%d ; LAYER %d', $layerZ, $travelFeedRate, 1 + $layerId));
 	if(@activeToolBlocks) {
-		print STDERR "  CONTINUE WITH ACTIVE TOOL $activeTool: ". (1+$#activeToolBlocks) ." BLOCKS\n"; #DEBUG
+		print STDERR "  CONTINUE WITH ACTIVE TOOL $activeTool: ". (1+$#activeToolBlocks) ." BLOCKS\n" if($debug);
 		for(my $i=0; $i<=$#activeToolBlocks; $i++) {
 			outputTransformedCode($activeToolBlocks[$i]);
 			if($i < $#activeToolBlocks) {
@@ -218,12 +247,12 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 	# highestToolChange may be off by one due to the optimisation.
 	if($layerZ <= $highestToolChange && !($layerZ == $highestToolChange && !@otherToolBlocks)) {
 		if(!@otherToolBlocks && $toolStillActiveNextLayer) {
-			print STDERR "  TOP UP PRIMING TOWER\n"; #DEBUG
+			print STDERR "  TOP UP PRIMING TOWER\n" if($debug);
 			outputTopUpPrimingTower($isLayer1);
 		}
 		else {
-			print STDERR "  SWITCH TO OTHER TOOL $otherTool\n"; #DEBUG
-			print STDERR "  AND PRINT ". (1+$#otherToolBlocks) ." BLOCKS\n"; #DEBUG
+			print STDERR "  SWITCH TO OTHER TOOL $otherTool\n" if($debug);
+			print STDERR "  AND PRINT ". (1+$#otherToolBlocks) ." BLOCKS\n" if($debug);
 			push(@output, doRetractMove(-$retractLenTC[$activeTool]) .' ; tool change retract');
 			outputToolChangeAndPrime($isLayer1);
 			for(my $i=0; $i<=$#otherToolBlocks; $i++) {
@@ -556,13 +585,13 @@ sub outputToolChangeAndPrime
 	}
 	my $newTemperature = $isLayer1 ? $toolTemperatureL1[$nextTool] : $toolTemperature[$nextTool];
 	push(@output, "M104 S${newTemperature} T${nextTool} ; heat active nozzle");
-	# Move to the tower
+	# Move to the hollow tower center, which will catch any ooze created during heating.
 	push(@output, sprintf('G1 X%.3f Y%.3f F%d', $squareX, $squareY, $travelFeedRate));
 	# Do the tool swap. Use workaround to do the move at a reasonable speed, because it is not accelerated.
-	# TODO: I could parse the original tool change code from the file and fill in the template.
+	# TODO: I could parse the original tool change code from the file, and fill in the template.
 	$activeTool = $nextTool;
 	# I have found the M108 command to be utterly irrelevant for the FFCP, but I insert it anyway
-	# in case other tools rely on it to know the tool has changed.
+	# in case other scripts rely on it to know the tool has changed.
 	push(@output, ('G1 F5000; speed for tool change.',
 	               "T${activeTool}; do actual tool swap",
 	               "M108 T${activeTool}",
@@ -571,6 +600,9 @@ sub outputToolChangeAndPrime
 	# for several seconds and possibly already disabling the fan while we might still be printing
 	# a difficult overhang.
 	push(@output, 'M127; disable fan') if($fanEnabled);
+	# Only wait for the active nozzle to heat. The inactive nozzle should have cooled down enough
+	# by that time that it will no longer ooze. It is actually better not to wait until it has
+	# cooled down entirely, or the wipe may not be successful.
 	push(@output, "M6 T${activeTool} ; wait for extruder to heat up");
 	push(@output, 'G4 P'. int(1000 * $dwell) .' ; wait') if($dwell);
 
@@ -583,7 +615,8 @@ sub outputToolChangeAndPrime
 		               $extrusionScale, $isLayer1, 0);
 	# Do a normal retract. The logic in transformCodeBlock will ensure an unretract when normal code resumes.
 	push(@output, doRetractMove(-$retractLen[$activeTool]) .' ; normal retract');
-	# Wipe the ooze from the deactivated nozzle
+	# Wipe the ooze from the deactivated nozzle.
+	# TODO: shuffle the wipe position, so the next tool change won't bump into any wiped ooze from this one.
 	push(@output, sprintf('G1 X%.3f Y%.3f F%d', $squareX, $squareY, $travelFeedRate));
 	# Again, the fan would enable way earlier than I would like it to, therefore block it with a
 	# pipeline flush. Enable the fan before the wipe move, so it has some time to spin up.
@@ -605,7 +638,7 @@ sub outputTopUpPrimingTower
 	my $extrusionScale = ($isLayer1 ? $extruScaleL1[$activeTool] : $extruScale[$activeTool]);
 
 	# Print a minimal tower layer to ensure continuity of the tower (unless this is the first
-	# layer, then we want a solid base)
+	# layer, then we want a solid base).
 	my $how = $isLayer1 ? 'full' : 'hollow';
 	push(@output, "; Print priming tower (${how})");
 	my $maxPerim = $isLayer1 ? 0 : $towerMaintainPerimeters;

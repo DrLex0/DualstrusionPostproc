@@ -1,9 +1,10 @@
 ;- - - Custom G-code for dual extruder printing with FlashForge Creator Pro - - -
 ;- - - FOR USE IN COMBINATION WITH DUALSTRUSION POST-PROCESSING SCRIPT ONLY - - -
 ;- - - Using it without the script will result in the print failing horribly! - - -
-;- - - by DrLex; 2016/09-2017/02. Released under Creative Commons Attribution License. - - -
+;- - - by DrLex; 2016/09-2017/03. Released under Creative Commons Attribution License. - - -
 ; NOTE: it is advisable to ensure the left nozzle is clean (no oozed filament string)
-; because the ‘chop’ operation might not work at the lower temperature.
+; because the ‘chop’ operation might not work at the lower temperature. Clean nozzles
+; are recommended anyway because of reduced risk that they will carry ooze around.
 ;
 ;SUMMARY
 ;
