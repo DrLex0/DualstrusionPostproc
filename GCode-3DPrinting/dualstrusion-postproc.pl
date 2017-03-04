@@ -49,7 +49,7 @@ my $dwell = 0;
 my $towerMaintainPerimeters = 2;
 
 # Enable debug output
-my $debug = 1;
+my $debug = 0;
 
 # These values will be overridden with those found in the file.
 my @retractLen = (1, 1);
