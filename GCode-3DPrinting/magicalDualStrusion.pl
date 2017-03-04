@@ -1,6 +1,6 @@
 #!/usr/bin/perl -w
 # Dualstrusion post-processing script for Slic3r output and a Replicator Dual-like printer.
-# Version: 0.1
+# Version: 0.2
 # Alexander Thomas a.k.a. DrLex, https://www.dr-lex.be/
 # Released under Creative Commons Attribution 4.0 International license.
 #
@@ -19,6 +19,9 @@
 #
 # This script assumes you are using the custom G-code I published at
 #    https://www.dr-lex.be/info-stuff/print3d-ffcp.html#slice_gcode
+# This script also assumes constant layer height (different first layer height allowed).
+#   This also means supports cannot be used unless they are printed in the same layers as the
+#   object.
 
 use strict;
 
@@ -34,7 +37,7 @@ my $squareMargin = 12;
 # It should be the smallest possible drop that stops the oozing. This is highly recommended because
 # without this, ooze will be sprinkled all across your print.
 # Still, if you want to disable it for a quick & literally dirty print, set it to 0.
-my $temperatureDrop = 50;
+my $temperatureDrop = 45;
 
 # Optional time to let the nozzles sit idle in between the tool change and priming the active nozzle.
 # Set to 0 to disable. It can be used to give the inactive nozzle extra time to cool down, but it
@@ -151,6 +154,10 @@ if($debug) {
 	print STDERR "Layer 1 extrusion scale factors: $extruScaleL1[0], $extruScaleL1[1]\n";
 }
 my ($squareX, $squareY) = (($minX + $maxX)/2, $maxY + $squareMargin);
+
+# This has two functions: first, ensure that the nozzle doesn't collide with any ooze from a
+# previous wipe, and second, do not park the heating nozzle always exactly above the same spot.
+my $wipeOffset = 0;
 
 # Scale factor = layer_height/0.2 * filament_diameter/1.75 * nozzle_diameter/0.4 * extrusion_multiplier
 # Layer 1 SF = first_layer_height/0.25 * filament_diameter/1.75 * nozzle_diameter/0.4 * extrusion_multiplier
@@ -576,6 +583,8 @@ sub outputToolChangeAndPrime
 {
 	my $isLayer1 = shift;
 	my $nextTool = ($activeTool == 0 ? 1 : 0);
+	$wipeOffset = ($wipeOffset + 1) % 3;
+	my $yOffset = ($wipeOffset - 1) * 1.5;
 
 	push(@output, '; - - - - - START TOOL CHANGE AND PRIME NOZZLE - - - - -');
 	# Drop the temperature of this nozzle and raise the other
@@ -586,7 +595,8 @@ sub outputToolChangeAndPrime
 	my $newTemperature = $isLayer1 ? $toolTemperatureL1[$nextTool] : $toolTemperature[$nextTool];
 	push(@output, "M104 S${newTemperature} T${nextTool} ; heat active nozzle");
 	# Move to the hollow tower center, which will catch any ooze created during heating.
-	push(@output, sprintf('G1 X%.3f Y%.3f F%d', $squareX, $squareY, $travelFeedRate));
+	# Add a variable Y offset so we don't always ooze and wipe at the same position.
+	push(@output, sprintf('G1 X%.3f Y%.3f F%d', $squareX, $squareY + $yOffset, $travelFeedRate));
 	# Do the tool swap. Use workaround to do the move at a reasonable speed, because it is not accelerated.
 	# TODO: I could parse the original tool change code from the file, and fill in the template.
 	$activeTool = $nextTool;
@@ -616,14 +626,14 @@ sub outputToolChangeAndPrime
 	# Do a normal retract. The logic in transformCodeBlock will ensure an unretract when normal code resumes.
 	push(@output, doRetractMove(-$retractLen[$activeTool]) .' ; normal retract');
 	# Wipe the ooze from the deactivated nozzle.
-	# TODO: shuffle the wipe position, so the next tool change won't bump into any wiped ooze from this one.
-	push(@output, sprintf('G1 X%.3f Y%.3f F%d', $squareX, $squareY, $travelFeedRate));
+	push(@output, sprintf('G1 X%.3f Y%.3f F%d', $squareX, $squareY + $yOffset, $travelFeedRate));
 	# Again, the fan would enable way earlier than I would like it to, therefore block it with a
 	# pipeline flush. Enable the fan before the wipe move, so it has some time to spin up.
 	push(@output, ('G4 P0', 'M126; re-enable fan')) if($fanEnabled);
 	my $move = $nozzleDistance;
 	$move *= -1 if($activeTool == 1);
-	push(@output, sprintf('G1 X%.3f Y%.3f F%d ; wipe nozzle on tower', $squareX + $move, $squareY, $wipeFeedRate));
+	push(@output, sprintf('G1 X%.3f Y%.3f F%d ; wipe nozzle on tower',
+	                      $squareX + $move, $squareY + $yOffset, $wipeFeedRate));
 	push(@output, '; - - - - - END TOOL CHANGE AND PRIME NOZZLE - - - - -');
 }
 

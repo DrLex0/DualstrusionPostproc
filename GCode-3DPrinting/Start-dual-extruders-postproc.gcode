@@ -144,7 +144,7 @@
 T0; set primary extruder
 ; Although we will first initialise the left extruder, do not do a tool change until everything is ready to avoid all kinds of quirks.
 M73 P0; enable show build progress
-M140 S[first_layer_bed_temperature] T0; heat bed up to first layer temperature
+M140 S[first_layer_bed_temperature]; heat bed up to first layer temperature
 M104 S140 T0; preheat right nozzle to 140 degrees, this should not cause oozing
 M104 S140 T1; preheat left nozzle to 140 degrees, this should not cause oozing
 M127; disable fan
@@ -164,7 +164,7 @@ G1 X135 Y75 F1500; do a slow small move because the first move is likely not acc
 G1 X-70 Y-81 F10000; move to waiting position (front left corner of print bed), also makes room for the tool change
 G1 F6000; set speed for tool change (see ToolChange.gcode for explanation)
 M18 Z E; disable Z and extruder steppers while heating
-M6 T0; wait for bed (and right extruder) to heat up
+M190 S[first_layer_bed_temperature]; wait for bed to heat up
 M104 S[first_layer_temperature_0] T0; set 1st nozzle heater to first layer temperature
 M6 T0; wait for right extruder to heat up
 M17; re-enable all steppers
