@@ -1,8 +1,11 @@
 #!/usr/bin/perl -w
 # Dualstrusion post-processing script for Slic3r output and a Replicator Dual-like printer.
-# Version: 0.2
+# Version: 0.3
 # Alexander Thomas a.k.a. DrLex, https://www.dr-lex.be/
 # Released under Creative Commons Attribution 4.0 International license.
+#
+# Usage: dualstrusion-postproc.pl [-d] input.gcode > output.gcode
+#   -d enables debug output on stderr.
 #
 # Features:
 # * Minimise the number of tool changes.
@@ -138,6 +141,11 @@ my @squareCoords = (
 
 
 ###### MAIN ######
+if($ARGV[0] eq '-d') {
+	$debug = 1;
+	shift;
+}
+
 my $inFile = shift;
 die "Need input file as argument!\n" if(!$inFile);
 
@@ -147,7 +155,7 @@ my (@header, @footer, @layerHeights);
 # Chunks of code grouped per tool and per layer height. Each layer height may contain multiple groups of code blocks. The key is "${tool}_${layerheight}".
 my %toolLayers;
 
-my ($minX, $minY, $maxX, $maxY, $highestToolChange) = parseInputFile($inFile, \@header, \@footer, \%toolLayers, \@layerHeights);
+my ($minX, $minY, $maxX, $maxY) = parseInputFile($inFile, \@header, \@footer, \%toolLayers, \@layerHeights);
 if($debug) {
 	print STDERR "Found XY bounds as ${minX}~${maxX}, ${minY}~${maxY}\n";
 	print STDERR "Normal extrusion scale factors:  $extruScale[0], $extruScale[1]\n";
@@ -175,7 +183,7 @@ foreach my $layerZ (@layerHeights) {
 	foreach my $key ("0_${layerZ}", "1_${layerZ}") {
 		my $blockListRef = $toolLayers{$key};
 		next if(!$blockListRef);
-		
+
 		my @cleanedBlocks;
 		foreach my $blockRef (@{$blockListRef}) {
 			while(@{$blockRef} && $$blockRef[-1] =~ /^(G1 E\S+ |\s*;|\s*$)/) {
@@ -202,6 +210,27 @@ foreach my $layerZ (@layerHeights) {
 # Even if there is no T0 material in the first layer, Slic3r will print a skirt with T0 and then swap tools.
 # If this ever changes or the user deems a skirt unnecessary, this script might break.
 my $activeTool = 0;
+my ($highestToolChangeZ, $highestToolChangeN) = (0, 0);
+
+# Find the highest layer that has a tool change. For this, we mimic the logic of the processing
+# below, because trying to find a single formula for this is bad for mental sanity, mostly because
+# of to the $toolStillActiveNextLayer optimisation.
+for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
+	my $layerZ = $layerHeights[$layerId];
+	my $nextLayerZ = ($layerId < $#layerHeights ? $layerHeights[$layerId + 1] : 0);
+	my $otherTool = ($activeTool == 0 ? 1 : 0);
+	
+	my $hasOtherTool = defined($toolLayers{"${otherTool}_${layerZ}"});
+	my $toolStillActiveNextLayer = defined($toolLayers{"${activeTool}_${nextLayerZ}"}) || $nextLayerZ == 0;
+	if($hasOtherTool || !$toolStillActiveNextLayer) {
+		$highestToolChangeZ = $layerZ;
+		$highestToolChangeN = 1 + $layerId;
+		$activeTool = $otherTool;
+	}
+}
+print STDERR "Highest tool change at layer ${highestToolChangeN}, Z=${highestToolChangeZ}\n" if($debug);
+
+$activeTool = 0;
 my @originalE = (0, 0);  # How much was extruded by the original file at the current input line.
 my @offsetE   = (0, 0);  # The offset we're adding, i.e. how much extra filament my extra code has pushed out
 my @retracted = (0, -1);  # How far the extruders are currently retracted (regardless of done by the original code, or mine). These values can only be negative or 0. Mind that we assume that T1 starts out retracted, this should be valid when using my start G-code and considering the way Slic3r handles dualstrusion.
@@ -221,7 +250,7 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 	my $layerZ = $layerHeights[$layerId];
 	my $nextLayerZ = ($layerId < $#layerHeights ? $layerHeights[$layerId + 1] : 0);
 
-	print STDERR "LAYER ${layerId}: ${layerZ}\n" if($debug);
+	print STDERR 'LAYER '. (1 + $layerId) .": ${layerZ}\n" if($debug);
 	# Check what tools are active in this layer and the next.
 	my (@activeToolBlocks, @otherToolBlocks);
 	my $otherTool = ($activeTool == 0 ? 1 : 0);
@@ -250,10 +279,8 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 			}
 		}
 	}
-	# Because Slic3r does tool changes at the start of a layer, our previous detection of
-	# highestToolChange may be off by one due to the optimisation.
-	if($layerZ <= $highestToolChange && !($layerZ == $highestToolChange && !@otherToolBlocks)) {
-		if(!@otherToolBlocks && $toolStillActiveNextLayer) {
+	if($layerZ <= $highestToolChangeZ) {
+		if(!@otherToolBlocks && $toolStillActiveNextLayer && $layerZ < $highestToolChangeZ) {
 			print STDERR "  TOP UP PRIMING TOWER\n" if($debug);
 			outputTopUpPrimingTower($isLayer1);
 		}
@@ -280,7 +307,7 @@ print join("\n", (@header, @output, @footer)) ."\n";
 ###### SUBROUTINES ######
 sub parseInputFile
 # Chop up the file into header, footer, and code blocks grouped per layer and per tool.
-# Returns print bounds and layer height at which the last tool change occurs.
+# Returns print bounds.
 # Requires @header, @footer, @layerHeights, and %toolLayers to be defined.
 {
 	my $fName = shift;
@@ -290,7 +317,6 @@ sub parseInputFile
 	my ($currentZ, $layerNumber, $activeTool) = (0) x 3;
 	# This code will fail for printers with a print bed larger than 65 metres. Too bad.
 	my ($minX, $minY, $maxX, $maxY) = (32768, 32768, -32768, -32768);
-	my $highestToolChange = 0;
 
 	# Reference to the anonymous array inside %toolLayers to which we're currently appending code lines
 	my $toolLayerRef;
@@ -403,7 +429,6 @@ sub parseInputFile
 			$toolLayers{"${activeTool}_${currentZ}"} = [] if(!defined($toolLayers{"${activeTool}_${currentZ}"}));
 			push($toolLayers{"${activeTool}_${currentZ}"}, []);  # Start a new block
 			$toolLayerRef = $toolLayers{"${activeTool}_${currentZ}"}[-1];
-			$highestToolChange = $currentZ;
 			next;
 		}
 		elsif($line =~ /^G1 Z(\S+)([ ;]|$)/) {  # Layer change
@@ -430,7 +455,7 @@ sub parseInputFile
 		exit(1);
 	}
 	
-	return ($minX, $minY, $maxX, $maxY, $highestToolChange);
+	return ($minX, $minY, $maxX, $maxY);
 }
 
 sub doRetractMove
