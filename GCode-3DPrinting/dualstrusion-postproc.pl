@@ -1,6 +1,6 @@
 #!/usr/bin/perl -w
 # Dualstrusion post-processing script for Slic3r output and a Replicator Dual-like printer.
-# Version: 0.3
+# Version: 0.4
 # Alexander Thomas a.k.a. DrLex, https://www.dr-lex.be/
 # Released under Creative Commons Attribution 4.0 International license.
 #
@@ -22,9 +22,11 @@
 #
 # This script assumes you are using the custom G-code I published at
 #    https://www.dr-lex.be/info-stuff/print3d-ffcp.html#slice_gcode
-# This script also assumes constant layer height (different first layer height allowed).
-#   This also means supports cannot be used unless they are printed in the same layers as the
-#   object.
+# Variable layer heights are allowed. It should also work with supports printed at layer heights
+#   different from the object's, but this is not recommended as it will incur additional tool
+#   changes. You should enable 'Synchronize with object layers' in Slic3r.
+#
+# Warning: this is NOT compatible with Z lift yet. Enabling it will probably cause a huge mess.
 
 use strict;
 
@@ -61,15 +63,16 @@ my @retractLenTC = (3, 3);
 # These values will be parsed from the file unless the names have changed, and the scale factors
 # will be computed using these original values, which represent the values with which the
 # coordinates below were calculated.
-my ($layer_height, $first_layer_height) = (0.2, 0.25);
 my @filament_diameters = (1.75, 1.75);
 my @nozzle_diameters = (0.4, 0.4);
 my @extrusion_multipliers = (1.0, 1.0);
 
 # It is extremely important that these values can be parsed from the file. The script will simply
 # bail out if it doesn't find them.
-my @toolTemperature;
-my @toolTemperatureL1;
+my @temperature;
+my @first_layer_temperature;
+# We don't really need first_layer, but parse it anyway to omit the heat command if it is the same.
+my ($bed_temperature, $first_layer_bed_temperature);
 
 # I might also want to override some of these with values from the file, but these should be
 # sensible values for all cases.
@@ -77,11 +80,15 @@ my $travelFeedRate = 8400;
 my $retractFeedRate = 1800;
 my $wipeFeedRate = 4000;
 my $layer1FeedRate = 1200;
+
 # Feedrates for the inner and outer perimeters of the tower respectively. You could tweak the outer
 # rate to more closely match the normal print rate so there won't be a huge pressure difference
 # when the print resumes.
 my $innerFeedRate = 1200;
 my $outerFeedRate = 1200;
+
+# The thicknesses for which the extrusion coordinates below were calculated.
+my ($layerHeightDefault, $firstLayerHeightDefault) = (0.2, 0.25);
 
 # Layer 1 coordinates were generated for a 0.25mm layer, with a 0.4mm nozzle, printing 1.75mm filament at 20mm/s, 0.6mm width.
 my @squareLayer1Travels = (
@@ -151,7 +158,7 @@ die "Need input file as argument!\n" if(!$inFile);
 
 my @extruScale = (1, 1);
 my @extruScaleL1 = (1, 1);
-my (@header, @footer, @layerHeights);
+my (@header, @footer, @layerHeights, @layerThickness);
 # Chunks of code grouped per tool and per layer height. Each layer height may contain multiple groups of code blocks. The key is "${tool}_${layerheight}".
 my %toolLayers;
 
@@ -179,7 +186,9 @@ if(!@layerHeights) {
 # the very end, because we'll be replacing these with our own retracts. (Moreover, Slic3r first
 # changes layer and then retracts, so there will be blocks that only have a retract in them.)
 my $lastLayerZ = $layerHeights[-1];
+my $previousLayerZ = 0;
 foreach my $layerZ (@layerHeights) {
+	push(@layerThickness, $layerZ - $previousLayerZ);
 	foreach my $key ("0_${layerZ}", "1_${layerZ}") {
 		my $blockListRef = $toolLayers{$key};
 		next if(!$blockListRef);
@@ -204,6 +213,7 @@ foreach my $layerZ (@layerHeights) {
 			delete $toolLayers{$key};
 		}
 	}
+	$previousLayerZ = $layerZ;
 }
 
 # Assumption: we always start with T0 and always print a skirt on layer 1.
@@ -219,7 +229,7 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 	my $layerZ = $layerHeights[$layerId];
 	my $nextLayerZ = ($layerId < $#layerHeights ? $layerHeights[$layerId + 1] : 0);
 	my $otherTool = ($activeTool == 0 ? 1 : 0);
-	
+
 	my $hasOtherTool = defined($toolLayers{"${otherTool}_${layerZ}"});
 	my $toolStillActiveNextLayer = defined($toolLayers{"${activeTool}_${nextLayerZ}"}) || $nextLayerZ == 0;
 	if($hasOtherTool || !$toolStillActiveNextLayer) {
@@ -250,7 +260,7 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 	my $layerZ = $layerHeights[$layerId];
 	my $nextLayerZ = ($layerId < $#layerHeights ? $layerHeights[$layerId + 1] : 0);
 
-	print STDERR 'LAYER '. (1 + $layerId) .": ${layerZ}\n" if($debug);
+	print STDERR 'LAYER '. (1 + $layerId) .": ${layerZ}, thickness $layerThickness[$layerId]\n" if($debug);
 	# Check what tools are active in this layer and the next.
 	my (@activeToolBlocks, @otherToolBlocks);
 	my $otherTool = ($activeTool == 0 ? 1 : 0);
@@ -267,7 +277,7 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 	# Optimisation: if the next layer will start with the other tool, do not top up the tower
 	# but prime the next tool instead.
 	my $toolStillActiveNextLayer = defined($toolLayers{"${activeTool}_${nextLayerZ}"});
-	
+
 	push(@output, doRetractMove(-$retractLen[$activeTool]) .' ; normal retract') unless($retracted[$activeTool]);
 	push(@output, sprintf('G1 Z%.3f F%d ; LAYER %d', $layerZ, $travelFeedRate, 1 + $layerId));
 	if(@activeToolBlocks) {
@@ -282,13 +292,13 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 	if($layerZ <= $highestToolChangeZ) {
 		if(!@otherToolBlocks && $toolStillActiveNextLayer && $layerZ < $highestToolChangeZ) {
 			print STDERR "  TOP UP PRIMING TOWER\n" if($debug);
-			outputTopUpPrimingTower($isLayer1);
+			outputTopUpPrimingTower($isLayer1, $layerThickness[$layerId]);
 		}
 		else {
 			print STDERR "  SWITCH TO OTHER TOOL $otherTool\n" if($debug);
 			print STDERR "  AND PRINT ". (1+$#otherToolBlocks) ." BLOCKS\n" if($debug);
 			push(@output, doRetractMove(-$retractLenTC[$activeTool]) .' ; tool change retract');
-			outputToolChangeAndPrime($isLayer1);
+			outputToolChangeAndPrime($isLayer1, $layerThickness[$layerId]);
 			for(my $i=0; $i<=$#otherToolBlocks; $i++) {
 				outputTransformedCode($otherToolBlocks[$i]);
 				if($i < $#otherToolBlocks) {
@@ -297,7 +307,16 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 			}
 		}
 	}
-	next;
+
+	if($isLayer1) {
+		my $newTemp = $temperature[$activeTool];
+		if($newTemp != $first_layer_temperature[$activeTool]) {
+			push(@output, "M104 S${newTemp} T${activeTool} ; change to regular extrusion temperature");
+		}
+		if($bed_temperature != $first_layer_bed_temperature) {
+			push(@output, "M140 S${bed_temperature} ; set regular bed temperature");
+		}
+	}
 }
 
 print join("\n", (@header, @output, @footer)) ."\n";
@@ -308,7 +327,7 @@ print join("\n", (@header, @output, @footer)) ."\n";
 sub parseInputFile
 # Chop up the file into header, footer, and code blocks grouped per layer and per tool.
 # Returns print bounds.
-# Requires @header, @footer, @layerHeights, and %toolLayers to be defined.
+# Requires @header, @footer, @layerHeights, and %toolLayers to be declared.
 {
 	my $fName = shift;
 	open(my $fHandle, '<', $fName) or die "FAIL: cannot read file: $!";
@@ -322,7 +341,7 @@ sub parseInputFile
 	my $toolLayerRef;
 	my $lineNumber = 0;
 
-	my ($layerHeightOK, $firstLayerHOK, $filaDiamOK, $nozzleDiamOK, $extruMultiOK) = (0) x 5;
+	my ($filaDiamOK, $nozzleDiamOK, $extruMultiOK) = (0) x 3;
 
 	foreach my $line (<$fHandle>) {
 		$lineNumber++;
@@ -353,17 +372,7 @@ sub parseInputFile
 			push(@footer, $line);
 			# Use the OK flags to avoid adjusting the factors multiple times, should the file
 			# contain copy-pasted junk.
-			if($line =~ /^; layer_height = (.*)/ && !$layerHeightOK) {
-				my $factor = $1/$layer_height;
-				@extruScale = ($extruScale[0] * $factor, $extruScale[1] * $factor);
-				$layerHeightOK = 1;
-			}
-			elsif($line =~ /^; first_layer_height = (.*)/ && !$firstLayerHOK) {
-				my $factor = $1/$first_layer_height;
-				@extruScaleL1 = ($extruScaleL1[0] * $factor, $extruScaleL1[1] * $factor);
-				$firstLayerHOK = 1;
-			}
-			elsif($line =~ /^; filament_diameter = (.*)/ && !$filaDiamOK) {
+			if($line =~ /^; filament_diameter = (.+)/ && !$filaDiamOK) {
 				my ($dia0, $dia1) = split(/,/, $1);
 				my ($factor0, $factor1) = ($dia0/$filament_diameters[0],
 				                           $dia1/$filament_diameters[1]);
@@ -371,7 +380,7 @@ sub parseInputFile
 				@extruScaleL1 = ($extruScaleL1[0] * $factor0, $extruScaleL1[1] * $factor1);
 				$filaDiamOK = 1;
 			}
-			elsif($line =~ /^; nozzle_diameter = (.*)/ && !$nozzleDiamOK) {
+			elsif($line =~ /^; nozzle_diameter = (.+)/ && !$nozzleDiamOK) {
 				my ($dia0, $dia1) = split(/,/, $1);
 				my ($factor0, $factor1) = ($dia0/$nozzle_diameters[0],
 				                           $dia1/$nozzle_diameters[1]);
@@ -379,7 +388,7 @@ sub parseInputFile
 				@extruScaleL1 = ($extruScaleL1[0] * $factor0, $extruScaleL1[1] * $factor1);
 				$nozzleDiamOK = 1;
 			}
-			elsif($line =~ /^; extrusion_multiplier = (.*)/ && !$extruMultiOK) {
+			elsif($line =~ /^; extrusion_multiplier = (.+)/ && !$extruMultiOK) {
 				my ($mul0, $mul1) = split(/,/, $1);
 				my ($factor0, $factor1) = ($mul0/$extrusion_multipliers[0],
 				                           $mul1/$extrusion_multipliers[1]);
@@ -387,17 +396,23 @@ sub parseInputFile
 				@extruScaleL1 = ($extruScaleL1[0] * $factor0, $extruScaleL1[1] * $factor1);
 				$extruMultiOK = 1;
 			}
-			elsif($line =~ /^; retract_length = (.*)/ ) {
+			elsif($line =~ /^; retract_length = (.+)/ ) {
 				@retractLen = split(/,/, $1);
 			}
-			elsif($line =~ /^; retract_length_toolchange = (.*)/ ) {
+			elsif($line =~ /^; retract_length_toolchange = (.+)/ ) {
 				@retractLenTC = split(/,/, $1);
 			}
-			elsif($line =~ /^; first_layer_temperature = (.*)/ ) {
-				@toolTemperatureL1 = split(/,/, $1);
+			elsif($line =~ /^; first_layer_temperature = (.+)/ ) {
+				@first_layer_temperature = split(/,/, $1);
 			}
-			elsif($line =~ /^; temperature = (.*)/ ) {
-				@toolTemperature = split(/,/, $1);
+			elsif($line =~ /^; temperature = (.+)/ ) {
+				@temperature = split(/,/, $1);
+			}
+			elsif($line =~ /^; first_layer_bed_temperature = (\d+)/ ) {
+				$first_layer_bed_temperature = $1;
+			}
+			elsif($line =~ /^; bed_temperature = (\d+)/ ) {
+				$bed_temperature = $1;
 			}
 			next;
 		}
@@ -447,10 +462,10 @@ sub parseInputFile
 
 		push(@{$toolLayerRef}, $line) if(!$inToolChangeCode); 
 	}
-	if(!($layerHeightOK && $firstLayerHOK && $filaDiamOK && $nozzleDiamOK && $extruMultiOK)) {
+	if(!($filaDiamOK && $nozzleDiamOK && $extruMultiOK)) {
 		print STDERR "WARNING: not all extrusion parameters could be parsed from the file.\nExtrusion values may be wrong. Check the input file!\n";
 	}
-	if(!@toolTemperature || $#toolTemperature < 1 || !@toolTemperatureL1 || $#toolTemperatureL1 < 1) {
+	if(!@temperature || $#temperature < 1 || !@first_layer_temperature || $#first_layer_temperature < 1) {
 		print STDERR "FATAL: could not find 'temperature' and/or 'first_layer_temperature' values in the file, these are essential to avoid utter and complete b0rk.\n";
 		exit(1);
 	}
@@ -583,9 +598,9 @@ sub outputTransformedCode
 			$retracted[$activeTool] = 0 if($retracted[$activeTool] > 0);
 			push(@output, sprintf('G1 E%.5f %s', $e + $offsetE[$activeTool], $extra)) if($move);
 		}
-		elsif($line =~ /^M104 S\S+ T${inactiveTool}/) {
-			# Temperature change. Must be disabled for inactive tool.
-			push(@output, ";$line ; DISABLED: keep the inactive tool cool!");
+		elsif($line =~ /^M(104|140) S/) {
+			# Temperature changes. Disable always because they need to be performed at a different moment.
+			push(@output, ";${line} ; DISABLED, will be reinserted at the right location");
 		}
 		elsif($line =~ /^M108 T/) {
 			# Drop these to avoid any confusion, our own tool change code will insert this where appropriate
@@ -607,6 +622,8 @@ sub outputToolChangeAndPrime
 # Appends commands to @output to perform the tool change and prime the new nozzle.
 {
 	my $isLayer1 = shift;
+	my $thickness = shift;
+
 	my $nextTool = ($activeTool == 0 ? 1 : 0);
 	$wipeOffset = ($wipeOffset + 1) % 3;
 	my $yOffset = ($wipeOffset - 1) * 1.5;
@@ -615,9 +632,9 @@ sub outputToolChangeAndPrime
 	# Drop the temperature of this nozzle and raise the other
 	if($temperatureDrop) {
 		push(@output, sprintf('M104 S%d T%d ; drop temperature to inhibit oozing',
-		                      $toolTemperature[$activeTool] - $temperatureDrop, $activeTool));
+		                      $temperature[$activeTool] - $temperatureDrop, $activeTool));
 	}
-	my $newTemperature = $isLayer1 ? $toolTemperatureL1[$nextTool] : $toolTemperature[$nextTool];
+	my $newTemperature = $isLayer1 ? $first_layer_temperature[$nextTool] : $temperature[$nextTool];
 	push(@output, "M104 S${newTemperature} T${nextTool} ; heat active nozzle");
 	# Move to the hollow tower center, which will catch any ooze created during heating.
 	# Add a variable Y offset so we don't always ooze and wipe at the same position.
@@ -643,7 +660,9 @@ sub outputToolChangeAndPrime
 
 	# Print a full tower layer to prime the nozzle.
 	push(@output, '; Print priming tower (full)');
-	my $extrusionScale = ($isLayer1 ? $extruScaleL1[$activeTool] : $extruScale[$activeTool]);
+	my $extrusionScale = $isLayer1 ?
+		$extruScaleL1[$activeTool] * $thickness / $firstLayerHeightDefault :
+		$extruScale[$activeTool] * $thickness / $layerHeightDefault;
 	$offsetE[$activeTool] +=
 		generateSquare($squareX, $squareY,
 		               $originalE[$activeTool] + $offsetE[$activeTool],
@@ -665,18 +684,21 @@ sub outputToolChangeAndPrime
 sub outputTopUpPrimingTower
 {
 	my $isLayer1 = shift;
+	my $thickness = shift;
 
 	push(@output, '; - - - - - START MAINTAINING PRIMING TOWER - - - - -');
 	# Retract for the travel move
 	push(@output, doRetractMove(-$retractLen[$activeTool]) .' ; normal retract') if(! $retracted[$activeTool]);
 	# Don't move to the tower center, the tower code will make the travel move directly to the starting point.
-	my $extrusionScale = ($isLayer1 ? $extruScaleL1[$activeTool] : $extruScale[$activeTool]);
 
 	# Print a minimal tower layer to ensure continuity of the tower (unless this is the first
 	# layer, then we want a solid base).
 	my $how = $isLayer1 ? 'full' : 'hollow';
 	push(@output, "; Print priming tower (${how})");
 	my $maxPerim = $isLayer1 ? 0 : $towerMaintainPerimeters;
+	my $extrusionScale = $isLayer1 ?
+		$extruScaleL1[$activeTool] * $thickness / $firstLayerHeightDefault :
+		$extruScale[$activeTool] * $thickness / $layerHeightDefault;
 	$offsetE[$activeTool] +=
 		generateSquare($squareX, $squareY,
 		               $originalE[$activeTool] + $offsetE[$activeTool],
