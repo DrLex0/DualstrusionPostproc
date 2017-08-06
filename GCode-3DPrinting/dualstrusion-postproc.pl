@@ -1,6 +1,6 @@
 #!/usr/bin/perl -w
 # Dualstrusion post-processing script for Slic3r output and a Replicator Dual-like printer.
-# Version: 0.4
+# Version: 0.5
 # Alexander Thomas a.k.a. DrLex, https://www.dr-lex.be/
 # Released under Creative Commons Attribution 4.0 International license.
 #
@@ -20,13 +20,23 @@
 # It is recommended to enable a tall skirt because the wipe is not always perfect, and the
 # active nozzle will ooze during the travel move from the tower to the print.
 #
+# Limitation: the print must start with the right extruder. Otherwise things will go haywire.
+#   If need be, add a dummy object to the first layer and assign it to the right extruder.
+#
 # This script assumes you are using the custom G-code I published at
 #    https://www.dr-lex.be/info-stuff/print3d-ffcp.html#slice_gcode
+#    You could adapt it to your own G-code snippets by modifying the parseInputFile method.
 # Variable layer heights are allowed. It should also work with supports printed at layer heights
 #   different from the object's, but this is not recommended as it will incur additional tool
 #   changes. You should enable 'Synchronize with object layers' in Slic3r.
+# Lift Z is now supported. Be sure to use it for inlays (coasters etc.), otherwise travel moves
+#   from the second color printed in the same layer, risk smudging the first color.
 #
-# Warning: this is NOT compatible with Z lift yet. Enabling it will probably cause a huge mess.
+# TODOs: 1. make the priming tower more stable at tall heights, either rotate it 45° or make it
+#           more circular.
+#        2. allow any extruder to be the first one to start printing.
+#        3. smarter priming tower placement and shifting of the print if necessary to keep
+#           everything on the platform.
 
 use strict;
 
@@ -38,7 +48,7 @@ my $nozzleDistance = 34;
 my $squareMargin = 12;
 
 # Number of degrees Celsius to lower the inactive extruder's temperature. How much is needed,
-# depends on your material and favourite printing temperatures, but 50 is probably a good value.
+# depends on your material and favourite printing temperatures, but 45 is probably a good value.
 # It should be the smallest possible drop that stops the oozing. This is highly recommended because
 # without this, ooze will be sprinkled all across your print.
 # Still, if you want to disable it for a quick & literally dirty print, set it to 0.
@@ -56,9 +66,17 @@ my $towerMaintainPerimeters = 2;
 # Enable debug output
 my $debug = 0;
 
+#### The variables below should normally not be modified. ####
+
+# The factor between mm/s values as used by Slic3r, and the feed rates as specified in the G-code.
+my $feedRateMultiplier = 60; 
+
 # These values will be overridden with those found in the file.
 my @retractLen = (1, 1);
-my @retractLenTC = (3, 3);
+my @retractLenTC = (2, 2);
+my @retractLift = (0, 0);
+my @retractLiftAbove = (0, 0);
+my @retractLiftBelow = (0, 0);  # if below is 0, it actually means: always lift
 
 # These values will be parsed from the file unless the names have changed, and the scale factors
 # will be computed using these original values, which represent the values with which the
@@ -74,12 +92,13 @@ my @first_layer_temperature;
 # We don't really need first_layer, but parse it anyway to omit the heat command if it is the same.
 my ($bed_temperature, $first_layer_bed_temperature);
 
-# I might also want to override some of these with values from the file, but these should be
-# sensible values for all cases.
+# These should also be parsed although these defaults should be sensible.
 my $travelFeedRate = 8400;
-my $retractFeedRate = 1800;
-my $wipeFeedRate = 4000;
+my @retractFeedRate = (1800, 1800);
 my $layer1FeedRate = 1200;
+
+# This has proven to be a generally good speed to chop off ooze on something else.
+my $wipeFeedRate = 4000;
 
 # Feedrates for the inner and outer perimeters of the tower respectively. You could tweak the outer
 # rate to more closely match the normal print rate so there won't be a huge pressure difference
@@ -260,7 +279,7 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 	my $layerZ = $layerHeights[$layerId];
 	my $nextLayerZ = ($layerId < $#layerHeights ? $layerHeights[$layerId + 1] : 0);
 
-	print STDERR 'LAYER '. (1 + $layerId) .": ${layerZ}, thickness $layerThickness[$layerId]\n" if($debug);
+	printf STDERR "LAYER %d: ${layerZ}, thickness %.6g\n", (1 + $layerId, $layerThickness[$layerId]) if($debug);
 	# Check what tools are active in this layer and the next.
 	my (@activeToolBlocks, @otherToolBlocks);
 	my $otherTool = ($activeTool == 0 ? 1 : 0);
@@ -278,31 +297,31 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 	# but prime the next tool instead.
 	my $toolStillActiveNextLayer = defined($toolLayers{"${activeTool}_${nextLayerZ}"});
 
-	push(@output, doRetractMove(-$retractLen[$activeTool]) .' ; normal retract') unless($retracted[$activeTool]);
+	push(@output, doRetractMove(-$retractLen[$activeTool]) .' ; normal retract1') unless($retracted[$activeTool]);
 	push(@output, sprintf('G1 Z%.3f F%d ; LAYER %d', $layerZ, $travelFeedRate, 1 + $layerId));
 	if(@activeToolBlocks) {
 		print STDERR "  CONTINUE WITH ACTIVE TOOL $activeTool: ". (1+$#activeToolBlocks) ." BLOCKS\n" if($debug);
 		for(my $i=0; $i<=$#activeToolBlocks; $i++) {
 			outputTransformedCode($activeToolBlocks[$i]);
-			if($i < $#activeToolBlocks) {
-				push(@output, doRetractMove(-$retractLen[$activeTool]) .' ; normal retract');
+			if($i < $#activeToolBlocks && !$retracted[$activeTool]) {
+				push(@output, doRetractMove(-$retractLen[$activeTool]) .' ; normal retract2');
 			}
 		}
 	}
 	if($layerZ <= $highestToolChangeZ) {
 		if(!@otherToolBlocks && $toolStillActiveNextLayer && $layerZ < $highestToolChangeZ) {
 			print STDERR "  TOP UP PRIMING TOWER\n" if($debug);
-			outputTopUpPrimingTower($isLayer1, $layerThickness[$layerId]);
+			outputTopUpPrimingTower($isLayer1, $layerThickness[$layerId], $layerZ);
 		}
 		else {
 			print STDERR "  SWITCH TO OTHER TOOL $otherTool\n" if($debug);
 			print STDERR "  AND PRINT ". (1+$#otherToolBlocks) ." BLOCKS\n" if($debug);
 			push(@output, doRetractMove(-$retractLenTC[$activeTool]) .' ; tool change retract');
-			outputToolChangeAndPrime($isLayer1, $layerThickness[$layerId]);
+			outputToolChangeAndPrime($isLayer1, $layerThickness[$layerId], $layerZ);
 			for(my $i=0; $i<=$#otherToolBlocks; $i++) {
 				outputTransformedCode($otherToolBlocks[$i]);
-				if($i < $#otherToolBlocks) {
-					push(@output, doRetractMove(-$retractLen[$activeTool]) .' ; normal retract');
+				if($i < $#otherToolBlocks && !$retracted[$activeTool]) {
+					push(@output, doRetractMove(-$retractLen[$activeTool]) .' ; normal retract3');
 				}
 			}
 		}
@@ -402,6 +421,15 @@ sub parseInputFile
 			elsif($line =~ /^; retract_length_toolchange = (.+)/ ) {
 				@retractLenTC = split(/,/, $1);
 			}
+			elsif($line =~ /^; retract_lift = (.+)/ ) {
+				@retractLift = split(/,/, $1);
+			}
+			elsif($line =~ /^; retract_lift_above = (.+)/ ) {
+				@retractLiftAbove = split(/,/, $1);
+			}
+			elsif($line =~ /^; retract_lift_below = (.+)/ ) {
+				@retractLiftBelow = split(/,/, $1);
+			}
 			elsif($line =~ /^; first_layer_temperature = (.+)/ ) {
 				@first_layer_temperature = split(/,/, $1);
 			}
@@ -413,6 +441,16 @@ sub parseInputFile
 			}
 			elsif($line =~ /^; bed_temperature = (\d+)/ ) {
 				$bed_temperature = $1;
+			}
+			elsif($line =~ /^; travel_speed = (\d*\.?\d+)/ ) {
+				$travelFeedRate = $1 * $feedRateMultiplier;
+			}
+			elsif($line =~ /^; retract_speed = (.+)/ ) {
+				my ($speed0, $speed1) = split(/,/, $1);
+				@retractFeedRate = ($speed0 * $feedRateMultiplier, $speed1 * $feedRateMultiplier);
+			}
+			elsif($line =~ /^; first_layer_speed = (\d*\.?\d+)/ ) {
+				$layer1FeedRate = $1 * $feedRateMultiplier;
 			}
 			next;
 		}
@@ -447,16 +485,46 @@ sub parseInputFile
 			next;
 		}
 		elsif($line =~ /^G1 Z(\S+)([ ;]|$)/) {  # Layer change
-			my $z = $1;
-			# For some reason Slic3r repeats G1 Zz commands even if the layer does not change.
-			if($z != $currentZ) {
-				$layerNumber++;
-				$currentZ = 1.0 * $z;
-				push(@layerHeights, $currentZ);
-				$toolLayers{"${activeTool}_${currentZ}"} = [] if(!defined($toolLayers{"${activeTool}_${currentZ}"}));
-				push($toolLayers{"${activeTool}_${currentZ}"}, []);  # Start a new block
-				$toolLayerRef = $toolLayers{"${activeTool}_${currentZ}"}[-1];
+			my $z = 1.0 * $1;  # Ensure it is treated as a number and is in standard format
+			next if($z == $currentZ);  # For some reason Slic3r repeats G1 Zz commands even if the layer does not change.
+			if($z < $currentZ) {
+				# Z went down again, meaning this must have been a 'lift Z'. Undo the presumed last layer change.
+				print STDERR "LIFT Z detected at z=$z\n" if($debug);
+				$layerNumber--;
+				pop(@layerHeights);
+				if($layerHeights[-1] != $z) {
+					print STDERR "WARNING: Z returned to different height after Z-hop, this makes no sense and things will probably go awry\n";
+				}
+				# We do want to preserve this Z move
+				push(@{$toolLayerRef}, $line);
+ 
+				# Append any blocks in the presumed layer to the last real layer.
+				# This is probably overkill because I don't expect there to be anything else than a single block
+				# with a single travel move, but since performance of this script is irrelevant, I go for safety.
+				foreach my $tool (0, 1) {
+					my $indexToMove = "${activeTool}_${currentZ}";
+					my $indexTarget = "${activeTool}_${z}";
+					if(defined($toolLayers{$indexToMove})) {
+						print STDERR "  Merging ${indexToMove} into ${indexTarget}\n" if($debug);
+						$toolLayers{$indexTarget} = [] if(!defined($toolLayers{$indexTarget}));
+						# Put the snubbed Z move back
+						push($toolLayers{$indexTarget}, ["G1 Z${currentZ} F${travelFeedRate} ; LIFT Z"]);
+						push($toolLayers{$indexTarget}, @{$toolLayers{$indexToMove}});
+						delete($toolLayers{$indexToMove});
+					}
+				}
+				$currentZ = $z;
 			}
+			else {
+				# Either a real layer change, or what will prove to be a Lift Z.
+				$layerNumber++;
+				$currentZ = $z;
+				push(@layerHeights, $currentZ);
+			}
+
+			$toolLayers{"${activeTool}_${currentZ}"} = [] if(!defined($toolLayers{"${activeTool}_${currentZ}"}));
+			push($toolLayers{"${activeTool}_${currentZ}"}, []);  # Start a new block
+			$toolLayerRef = $toolLayers{"${activeTool}_${currentZ}"}[-1];
 			next;
 		}
 
@@ -469,7 +537,8 @@ sub parseInputFile
 		print STDERR "FATAL: could not find 'temperature' and/or 'first_layer_temperature' values in the file, these are essential to avoid utter and complete b0rk.\n";
 		exit(1);
 	}
-	
+
+	print STDERR "Found a total of ${layerNumber} layers\n" if($debug);
 	return ($minX, $minY, $maxX, $maxY);
 }
 
@@ -490,7 +559,7 @@ sub doRetractMove
 		$retracted[$activeTool] = 0;
 	}
 
-	return sprintf('G1 E%.5f F%d', $newE, $retractFeedRate);
+	return sprintf('G1 E%.5f F%d', $newE, $retractFeedRate[$activeTool]);
 }
 
 sub generateSquare
@@ -500,9 +569,10 @@ sub generateSquare
 # The 'pos' variables specify the offset, and scaleE allows to scale the E coordinates.
 # If isLayer1 is true, first layer coordinates and speed will be used.
 # If maxPerim is non-zero, only that many outer perimeters will be printed at the outer perimeter speed.
+# If moveZTo is defined, a Z move to the given value will be performed after the first travel move.
 # Return value is the total increase in E coordinate.
 {
-	my ($posX, $posY, $posE, $scaleE, $isLayer1, $maxPerim) = @_;
+	my ($posX, $posY, $posE, $scaleE, $isLayer1, $maxPerim, $moveZTo) = @_;
 	my (@travels, @coords);
 	my ($innerFR, $outerFR);
 	# Obviously it would be way better to generate the coordinates and E values from scratch, but
@@ -533,6 +603,7 @@ sub generateSquare
 		                      $travels[$i][0] + $posX,
 		                      $travels[$i][1] + $posY,
 		                      $travelFeedRate));
+		push(@output, sprintf('G1 Z%.3f F%d', $moveZTo, $travelFeedRate)) if($i == 0 && defined($moveZTo));
 		push(@output, doRetractMove(-$retracted[$activeTool]) .' ; unretract') if($retracted[$activeTool]);
 		push(@output, "G1 F${feedRate}");
 		foreach my $coord (@{$coords[$i]}) {
@@ -621,8 +692,7 @@ sub outputTransformedCode
 sub outputToolChangeAndPrime
 # Appends commands to @output to perform the tool change and prime the new nozzle.
 {
-	my $isLayer1 = shift;
-	my $thickness = shift;
+	my ($isLayer1, $thickness, $layerZ) = @_;
 
 	my $nextTool = ($activeTool == 0 ? 1 : 0);
 	$wipeOffset = ($wipeOffset + 1) % 3;
@@ -630,15 +700,22 @@ sub outputToolChangeAndPrime
 
 	push(@output, '; - - - - - START TOOL CHANGE AND PRIME NOZZLE - - - - -');
 	# Drop the temperature of this nozzle and raise the other
+	my $newTemperature = $isLayer1 ? $first_layer_temperature[$nextTool] : $temperature[$nextTool];
+	push(@output, "M104 S${newTemperature} T${nextTool} ; heat active nozzle");
 	if($temperatureDrop) {
 		push(@output, sprintf('M104 S%d T%d ; drop temperature to inhibit oozing',
 		                      $temperature[$activeTool] - $temperatureDrop, $activeTool));
 	}
-	my $newTemperature = $isLayer1 ? $first_layer_temperature[$nextTool] : $temperature[$nextTool];
-	push(@output, "M104 S${newTemperature} T${nextTool} ; heat active nozzle");
+
+	# We only need to consider Z lift while moving to the tower. The move away from the tower will already have lift.
+	my $doLift = $retractLift[$activeTool] && $layerZ >= $retractLiftAbove[$activeTool] &&
+	             ($retractLiftBelow[$activeTool] == 0 || $layerZ <= $retractLiftBelow[$activeTool]);
+	push(@output, sprintf('G1 Z%.3f F%d ; LIFT Z (move to tower)', $layerZ + $retractLift[$activeTool], $travelFeedRate)) if($doLift);
 	# Move to the hollow tower center, which will catch any ooze created during heating.
 	# Add a variable Y offset so we don't always ooze and wipe at the same position.
 	push(@output, sprintf('G1 X%.3f Y%.3f F%d', $squareX, $squareY + $yOffset, $travelFeedRate));
+	push(@output, sprintf('G1 Z%.3f F%d', $layerZ, $travelFeedRate)) if($doLift);
+
 	# Do the tool swap. Use workaround to do the move at a reasonable speed, because it is not accelerated.
 	# TODO: I could parse the original tool change code from the file, and fill in the template.
 	$activeTool = $nextTool;
@@ -682,14 +759,20 @@ sub outputToolChangeAndPrime
 }
 
 sub outputTopUpPrimingTower
+# Appends commands to @output to add a layer to the priming tower with the current extruder.
 {
-	my $isLayer1 = shift;
-	my $thickness = shift;
+	my ($isLayer1, $thickness, $layerZ) = @_;
 
 	push(@output, '; - - - - - START MAINTAINING PRIMING TOWER - - - - -');
 	# Retract for the travel move
 	push(@output, doRetractMove(-$retractLen[$activeTool]) .' ; normal retract') if(! $retracted[$activeTool]);
 	# Don't move to the tower center, the tower code will make the travel move directly to the starting point.
+
+	my $doLift = $retractLift[$activeTool] && $layerZ >= $retractLiftAbove[$activeTool] &&
+	             ($retractLiftBelow[$activeTool] == 0 || $layerZ <= $retractLiftBelow[$activeTool]);
+	push(@output, sprintf('G1 Z%.3f F%d ; LIFT Z (move to tower)', $layerZ + $retractLift[$activeTool], $travelFeedRate)) if($doLift);
+	my $restoreZTo;
+	$restoreZTo = $layerZ if($doLift);
 
 	# Print a minimal tower layer to ensure continuity of the tower (unless this is the first
 	# layer, then we want a solid base).
@@ -702,7 +785,7 @@ sub outputTopUpPrimingTower
 	$offsetE[$activeTool] +=
 		generateSquare($squareX, $squareY,
 		               $originalE[$activeTool] + $offsetE[$activeTool],
-		               $extrusionScale, $isLayer1, $maxPerim);
+		               $extrusionScale, $isLayer1, $maxPerim, $restoreZTo);
 	# Retract before handing over control to the original code again.
 	# The logic in transformCodeBlock will ensure that an unretract is added when resuming
 	# printing, and additional attempts at retracts are ignored.
