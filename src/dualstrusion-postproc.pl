@@ -280,6 +280,9 @@ my @retracted = (0, -$initRetractT1);  # How far the extruders are currently ret
 my @wiping = (0, 0);  # Whether a wipe move was last seen on this extruder, necessary to correctly handle retractions during wiping.
 my $fanEnabled = 0;  # The fan should not be enabled during tool change and priming.
 
+push(@header, sprintf('M104 S%d T%d ; heat T1 to standby temperature while T0 starts',
+                      $temperature[1] - $temperatureDrop, 1));
+
 # Reassemble the file in optimal order and insert retractions and priming code where necessary.
 # For every layer:
 # Check what tools are used
@@ -774,6 +777,8 @@ sub outputToolChangeAndPrime
 	# Only wait for the active nozzle to heat. The inactive nozzle should have cooled down enough
 	# by that time that it will no longer ooze. It is actually better not to wait until it has
 	# cooled down entirely, or the wipe may not be successful.
+	# NOTE: the M6 command actually is a combined tool change + wait for heating. To merely wait,
+	# use an M109 command (but, it requires an extra S argument, so I prefer using M6 here).
 	push(@output, "M6 T${activeTool} ; wait for extruder to heat up");
 	push(@output, 'G4 P'. int(1000 * $dwell) .' ; wait') if($dwell);
 
