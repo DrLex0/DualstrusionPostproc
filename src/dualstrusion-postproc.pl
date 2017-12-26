@@ -1,6 +1,6 @@
 #!/usr/bin/perl -w
 # Dualstrusion post-processing script for Slic3r output and a Replicator Dual-like printer.
-# Version: 0.5
+# Version: 0.6
 # Alexander Thomas a.k.a. DrLex, https://www.dr-lex.be/
 # Released under Creative Commons Attribution 4.0 International license.
 #
@@ -18,14 +18,18 @@
 # * Disable fan during heating and priming.
 #
 # It is recommended to enable a tall skirt because the wipe is not always perfect, and the
-# active nozzle will ooze during the travel move from the tower to the print.
+# active nozzle will ooze during the travel move from the tower to the print. This skirt only
+# needs to reach up to the last layer that has two materials.
 #
-# Limitation: the print must start with the right extruder. Otherwise things will go haywire.
+# Limitation: the print must start with the right extruder (T0). Otherwise things will go haywire.
 #   If need be, add a dummy object to the first layer and assign it to the right extruder.
 #
 # This script assumes you are using the custom G-code I published at
 #    https://www.dr-lex.be/info-stuff/print3d-ffcp.html#slice_gcode
 #    You could adapt it to your own G-code snippets by modifying the parseInputFile method.
+# This version of the script MUST be used with the latest printer profiles and snippets that
+#   use relative E distances! It will output a dummy gcode file which only prints a message on
+#   the LCD if this condition is not met.
 # Variable layer heights are allowed. It should also work with supports printed at layer heights
 #   different from the object's, but this is not recommended as it will incur additional tool
 #   changes. You should enable 'Synchronize with object layers' in Slic3r.
@@ -34,8 +38,12 @@
 #
 # TODOs: 1. make the priming tower more stable at tall heights, either rotate it 45° or make it
 #           more circular.
-#        2. allow any extruder to be the first one to start printing.
-#        3. smarter priming tower placement and shifting of the print if necessary to keep
+#        2. allow any extruder to be the first one to start printing. This would mean altering
+#           the start G-code, or better: only let Slic3r insert a skeleton for the start G-code,
+#           and the script replaces this with the right bit of code.
+#        3. print our own additional wipe wall in between the tower and the print, to reduce the
+#           need for a tall skirt, which is especially wasteful on large prints.
+#        4. smarter priming tower placement and shifting of the print if necessary to keep
 #           everything on the platform.
 
 use strict;
@@ -62,6 +70,12 @@ my $dwell = 0;
 # Number of perimeters to print while printing a non-priming layer of the priming tower.
 # Two perimeters should be sufficient. Set to 0 to always print a full layer.
 my $towerMaintainPerimeters = 2;
+
+# Assume the unused tool to be retracted this far. This should be at least the normal retraction
+# distance for this extruder, plus some extra to combat the typical initial extrusion lag.
+# If you notice considerable lag when the second tool is first primed, increase this number.
+# If it squirts out too much of a blob, reduce it. In my setup, 1.6 proves a good value.
+my $initRetractT1 = 1.6;
 
 # Enable debug output
 my $debug = 0;
@@ -128,20 +142,20 @@ my @squareLayer1Travels = (
 );
 # This is a 20mm square, with a 5mm hole in the middle.
 my @squareLayer1Coords = (
-[[2.497, 2.997, 0.28364], [-2.497, 2.997, 0.56729], [-2.497, -1.997, 0.85093], [2.437, -1.997, 1.13117]],
-[[3.044, 3.544, 1.47686], [-3.044, 3.544, 1.82256], [-3.044, -2.544, 2.16825], [2.984, -2.544, 2.51054]],
-[[3.590, 4.090, 2.91828], [-3.590, 4.090, 3.32602], [-3.590, -3.090, 3.73377], [3.530, -3.090, 4.13811]],
-[[4.137, 4.637, 4.60790], [-4.137, 4.637, 5.07770], [-4.137, -3.637, 5.54749], [4.077, -3.637, 6.01388]],
-[[4.683, 5.183, 6.54572], [-4.683, 5.183, 7.07757], [-4.683, -4.183, 7.60941], [4.623, -4.183, 8.13785]],
-[[5.229, 5.729, 8.73175], [-5.229, 5.729, 9.32564], [-5.229, -4.729, 9.91954], [5.169, -4.729, 10.51003]],
-[[5.776, 6.276, 11.16597], [-5.776, 6.276, 11.82192], [-5.776, -5.276, 12.47787], [5.716, -5.276, 13.13040]],
-[[6.322, 6.822, 13.84840], [-6.322, 6.822, 14.56640], [-6.322, -5.822, 15.28439], [6.262, -5.822, 15.99898]],
-[[6.868, 7.368, 16.77903], [-6.868, 7.368, 17.55908], [-6.868, -6.368, 18.33912], [6.808, -6.368, 19.11576]],
-[[7.415, 7.915, 19.95786], [-7.415, 7.915, 20.79996], [-7.415, -6.915, 21.64206], [7.355, -6.915, 22.48075]],
-[[7.961, 8.461, 23.38489], [-7.961, 8.461, 24.28904], [-7.961, -7.461, 25.19319], [7.901, -7.461, 26.09393]],
-[[8.507, 9.007, 27.06013], [-8.507, 9.007, 28.02633], [-8.507, -8.007, 28.99252], [8.447, -8.007, 29.95532]],
-[[9.054, 9.554, 30.98356], [-9.054, 9.554, 32.01181], [-9.054, -8.554, 33.04006], [8.994, -8.554, 34.06490]],
-[[9.600, 10.100, 35.15520], [-9.600, 10.100, 36.24550], [-9.600, -9.100, 37.33580], [9.540, -9.100, 38.42269]]
+[[2.497, 2.997, 0.28364], [-2.497, 2.997, 0.28365], [-2.497, -1.997, 0.28364], [2.437, -1.997, 0.28024]],
+[[3.044, 3.544, 0.34569], [-3.044, 3.544, 0.34570], [-3.044, -2.544, 0.34569], [2.984, -2.544, 0.34229]],
+[[3.590, 4.090, 0.40774], [-3.590, 4.090, 0.40774], [-3.590, -3.090, 0.40775], [3.530, -3.090, 0.40434]],
+[[4.137, 4.637, 0.46979], [-4.137, 4.637, 0.46980], [-4.137, -3.637, 0.46979], [4.077, -3.637, 0.46639]],
+[[4.683, 5.183, 0.53184], [-4.683, 5.183, 0.53185], [-4.683, -4.183, 0.53184], [4.623, -4.183, 0.52844]],
+[[5.229, 5.729, 0.59390], [-5.229, 5.729, 0.59389], [-5.229, -4.729, 0.59390], [5.169, -4.729, 0.59049]],
+[[5.776, 6.276, 0.65594], [-5.776, 6.276, 0.65595], [-5.776, -5.276, 0.65595], [5.716, -5.276, 0.65253]],
+[[6.322, 6.822, 0.71800], [-6.322, 6.822, 0.71800], [-6.322, -5.822, 0.71799], [6.262, -5.822, 0.71459]],
+[[6.868, 7.368, 0.78005], [-6.868, 7.368, 0.78005], [-6.868, -6.368, 0.78004], [6.808, -6.368, 0.77664]],
+[[7.415, 7.915, 0.84210], [-7.415, 7.915, 0.84210], [-7.415, -6.915, 0.84210], [7.355, -6.915, 0.83869]],
+[[7.961, 8.461, 0.90414], [-7.961, 8.461, 0.90415], [-7.961, -7.461, 0.90415], [7.901, -7.461, 0.90074]],
+[[8.507, 9.007, 0.96620], [-8.507, 9.007, 0.96620], [-8.507, -8.007, 0.96619], [8.447, -8.007, 0.96280]],
+[[9.054, 9.554, 1.02824], [-9.054, 9.554, 1.02825], [-9.054, -8.554, 1.02825], [8.994, -8.554, 1.02484]],
+[[9.600, 10.100, 1.09030], [-9.600, 10.100, 1.09030], [-9.600, -9.100, 1.09030], [9.540, -9.100, 1.08689]]
 );
 
 # Coordinates were generated for a 0.2mm layer, with a 0.4mm nozzle, printing 1.75mm filament at 20mm/s, 0.6mm width.
@@ -156,13 +170,13 @@ my @squareTravels = (
 );
 # This is a 15mm square square, with a 8mm hole in the middle.
 my @squareCoords = (
-[[4.158, -3.658, 0.38517], [4.158, 4.658, 0.77033], [-4.158, 4.658, 1.15550], [-4.158, -3.598, 1.53788]],
-[[4.715, -4.215, 1.97465], [4.715, 5.215, 2.41143], [-4.715, 5.215, 2.84820], [-4.715, -4.155, 3.28220]],
-[[5.272, -4.772, 3.77058], [5.272, 5.772, 4.25896], [-5.272, 5.772, 4.74734], [-5.272, -4.712, 5.23295]],
-[[5.829, -5.329, 5.77294], [5.829, 6.329, 6.31293], [-5.829, 6.329, 6.85292], [-5.829, -5.269, 7.39014]],
-[[6.386, -5.886, 7.98174], [6.386, 6.886, 8.57334], [-6.386, 6.886, 9.16494], [-6.386, -5.826, 9.75376]],
-[[6.943, -6.443, 10.39697], [6.943, 7.443, 11.04019], [-6.943, 7.443, 11.68340], [-6.943, -6.383, 12.32383]],
-[[7.500, -7.000, 13.01865], [7.500, 8.000, 13.71347], [-7.500, 8.000, 14.40829], [-7.500, -6.940, 15.10033]]
+[[4.158, -3.658, 0.38517], [4.158, 4.658, 0.38516], [-4.158, 4.658, 0.38517], [-4.158, -3.598, 0.38238]],
+[[4.715, -4.215, 0.43677], [4.715, 5.215, 0.43678], [-4.715, 5.215, 0.43677], [-4.715, -4.155, 0.43400]],
+[[5.272, -4.772, 0.48838], [5.272, 5.772, 0.48838], [-5.272, 5.772, 0.48838], [-5.272, -4.712, 0.48561]],
+[[5.829, -5.329, 0.53999], [5.829, 6.329, 0.53999], [-5.829, 6.329, 0.53999], [-5.829, -5.269, 0.53722]],
+[[6.386, -5.886, 0.59160], [6.386, 6.886, 0.59160], [-6.386, 6.886, 0.59160], [-6.386, -5.826, 0.58882]],
+[[6.943, -6.443, 0.64321], [6.943, 7.443, 0.64322], [-6.943, 7.443, 0.64321], [-6.943, -6.383, 0.64043]],
+[[7.500, -7.000, 0.69482], [7.500, 8.000, 0.69482], [-7.500, 8.000, 0.69482], [-7.500, -6.940, 0.69204]]
 );
 
 
@@ -243,7 +257,7 @@ my ($highestToolChangeZ, $highestToolChangeN) = (0, 0);
 
 # Find the highest layer that has a tool change. For this, we mimic the logic of the processing
 # below, because trying to find a single formula for this is bad for mental sanity, mostly because
-# of to the $toolStillActiveNextLayer optimisation.
+# of the $toolStillActiveNextLayer optimisation.
 for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 	my $layerZ = $layerHeights[$layerId];
 	my $nextLayerZ = ($layerId < $#layerHeights ? $layerHeights[$layerId + 1] : 0);
@@ -260,9 +274,10 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 print STDERR "Highest tool change at layer ${highestToolChangeN}, Z=${highestToolChangeZ}\n" if($debug);
 
 $activeTool = 0;
-my @originalE = (0, 0);  # How much was extruded by the original file at the current input line.
-my @offsetE   = (0, 0);  # The offset we're adding, i.e. how much extra filament my extra code has pushed out
-my @retracted = (0, -1);  # How far the extruders are currently retracted (regardless of done by the original code, or mine). These values can only be negative or 0. Mind that we assume that T1 starts out retracted, this should be valid when using my start G-code and considering the way Slic3r handles dualstrusion.
+my @originalE = (0, 0);  # How much was extruded by the original file at the current input line. Only interesting for statistics.
+my @offsetE   = (0, 0);  # The offset we're adding, i.e. how much extra filament my extra code has pushed out. Only interesting for statistics.
+my @retracted = (0, -$initRetractT1);  # How far the extruders are currently retracted (regardless of done by the original code, or mine). These values can only be negative or 0.
+my @wiping = (0, 0);  # Whether a wipe move was last seen on this extruder, necessary to correctly handle retractions during wiping.
 my $fanEnabled = 0;  # The fan should not be enabled during tool change and priming.
 
 # Reassemble the file in optimal order and insert retractions and priming code where necessary.
@@ -360,7 +375,7 @@ sub parseInputFile
 	my $toolLayerRef;
 	my $lineNumber = 0;
 
-	my ($filaDiamOK, $nozzleDiamOK, $extruMultiOK) = (0) x 3;
+	my ($filaDiamOK, $nozzleDiamOK, $extruMultiOK, $relativeEOK) = (0) x 4;
 
 	foreach my $line (<$fHandle>) {
 		$lineNumber++;
@@ -371,6 +386,12 @@ sub parseInputFile
 			if($line =~ /;\@body(\s|;|$)/) {
 				$isHeaderPart1 = 0;
 				$isHeaderPart2 = 1;
+			}
+			elsif($line =~ /^M83(;|\s|$)/) {
+				$relativeEOK = 1;
+			}
+			elsif($line =~ /^M82(;|\s|$)/) {
+				$relativeEOK = 0;
 			}
 			push(@header, $line);
 			next;
@@ -537,6 +558,10 @@ sub parseInputFile
 		print STDERR "FATAL: could not find 'temperature' and/or 'first_layer_temperature' values in the file, these are essential to avoid utter and complete b0rk.\n";
 		exit(1);
 	}
+	if(!$relativeEOK) {
+		print STDERR "FATAL: The input file does not specify relative E coordinates in its start G-code, this is required for the dualstrusion post-processing script.\n";
+		exit(1);
+	}
 
 	print STDERR "Found a total of ${layerNumber} layers\n" if($debug);
 	return ($minX, $minY, $maxX, $maxY);
@@ -545,11 +570,9 @@ sub parseInputFile
 sub doRetractMove
 # Generates code for a retract (negative argument) or unretract (positive) move,
 # and updates the retract state of the current extruder.
-# The originalE and offsetE values are not updated, that is the responsibility
-# of the calling code.
+# The offsetE value may be updated if the move pushes out more than was previously retracted.
 {
 	my $retractDist = shift;
-	my $newE = $originalE[$activeTool] + $offsetE[$activeTool] + $retracted[$activeTool] + $retractDist;
 	# This code allows partial unretracts, although they do not make any sense and should never occur.
 	$retracted[$activeTool] += $retractDist;
 	# If there was extra length on unretract, add it to the offset. This assumes that only my code
@@ -559,7 +582,7 @@ sub doRetractMove
 		$retracted[$activeTool] = 0;
 	}
 
-	return sprintf('G1 E%.5f F%d', $newE, $retractFeedRate[$activeTool]);
+	return sprintf('G1 E%.5f F%d', $retractDist, $retractFeedRate[$activeTool]);
 }
 
 sub generateSquare
@@ -572,7 +595,7 @@ sub generateSquare
 # If moveZTo is defined, a Z move to the given value will be performed after the first travel move.
 # Return value is the total increase in E coordinate.
 {
-	my ($posX, $posY, $posE, $scaleE, $isLayer1, $maxPerim, $moveZTo) = @_;
+	my ($posX, $posY, $scaleE, $isLayer1, $maxPerim, $moveZTo) = @_;
 	my (@travels, @coords);
 	my ($innerFR, $outerFR);
 	# Obviously it would be way better to generate the coordinates and E values from scratch, but
@@ -588,14 +611,12 @@ sub generateSquare
 		@coords = @squareCoords;
 		($innerFR, $outerFR) = ($innerFeedRate, $outerFeedRate);
 	}
-	my $shiftE = 0;
 	if($maxPerim) {
-		# Another kludge due to working with a pre-computed table of coordinates:
-		# We need to shift the E coordinates over the distance we skip
-		$shiftE = -$coords[$#travels - $maxPerim][-1][2];
+		# Thanks to relative E coordinates, cutting away pieces of the precomputed tables is trivial.
 		splice(@travels, 0, 1 + $#travels - $maxPerim);
 		splice(@coords, 0, 1 + $#coords - $maxPerim);
 	}
+	my $eAdded = 0;
 	for(my $i=0; $i<=$#travels; $i++) {
 		my $feedRate = $innerFR;
 		$feedRate = $outerFR if($maxPerim || $i == $#travels);
@@ -607,14 +628,15 @@ sub generateSquare
 		push(@output, doRetractMove(-$retracted[$activeTool]) .' ; unretract') if($retracted[$activeTool]);
 		push(@output, "G1 F${feedRate}");
 		foreach my $coord (@{$coords[$i]}) {
+			$eAdded += ${$coord}[2];
 			push(@output, sprintf('G1 X%.3f Y%.3f E%.5f',
 			                      ${$coord}[0] + $posX,
 			                      ${$coord}[1] + $posY,
-			                      ($shiftE + ${$coord}[2]) * $scaleE + $posE));
+			                      ${$coord}[2] * $scaleE));
 		}
 	}
 
-	return ($shiftE + $coords[-1][-1][2]) * $scaleE;
+	return $eAdded * $scaleE;
 }
 
 sub outputTransformedCode
@@ -625,49 +647,69 @@ sub outputTransformedCode
 	my $inactiveTool = ($activeTool == 0 ? 1 : 0);
 
 	foreach my $line (@{$codeRef}) {
-		if($line =~ /^G1 X(\S+) Y(\S+) E(\S+)($|;.*|\s.*)/) {
-			# Print move: transform the E coordinate
-			my ($x, $y, $e, $extra) = ($1, $2, $3, $4);
-			$extra = '' if(! defined($extra));
-			if($retracted[$activeTool]) {
-				# The priming code retracted the nozzle (or something is fishy about the original code).
-				push(@output, doRetractMove(-$retracted[$activeTool]) .' ; UNRETRACT INSERTED');
+		if($line =~ /^G1 X\S+ Y\S+ E(\S+)($|;.*|\s.*)/) {
+			# Print move: insert unretract if needed
+			my $e = $1;
+			if($e > 0) {
+				if($retracted[$activeTool]) {
+					# The priming code retracted the nozzle (or something is fishy about the original code).
+					# TODO: should take extra length into account
+					push(@output, doRetractMove(-$retracted[$activeTool]) .' ; UNRETRACT INSERTED1');
+				}
+				$originalE[$activeTool] += $e;
+				$wiping[$activeTool] = 0;
 			}
-			push(@output, sprintf('G1 X%s Y%s E%.5f%s', $x, $y, $e + $offsetE[$activeTool], $extra));
-			$originalE[$activeTool] = $e;
+			else {
+				# Moves can be combined with retraction if 'wipe while retracting' is enabled.
+				$retracted[$activeTool] += $e;
+				$wiping[$activeTool] = 1;
+			}
+			push(@output, $line);
 		}
 		elsif($line =~ /^G1 F(\S+)($|;.*|\s.*)/) {
-			# Feedrate command which should always signal that printing will begin.
-			if($retracted[$activeTool]) {
+			# Feedrate command which should always signal that printing will begin,
+			# except when wiping while retracting.
+			if($retracted[$activeTool] && ! $wiping[$activeTool]) {
 				# The priming code retracted the nozzle (or something is fishy about the original code).
-				push(@output, doRetractMove(-$retracted[$activeTool]) .' ; UNRETRACT INSERTED');
+				# TODO: should take extra length into account
+				push(@output, doRetractMove(-$retracted[$activeTool]) .' ; UNRETRACT INSERTED2');
 			}
 			push(@output, $line);
 		}
 		elsif($line =~ /^G1 E(\S+) (.*)/) {
 			# Retract or unretract
 			my ($e, $extra) = ($1, $2);
-			my $move = $e - ($originalE[$activeTool] + $retracted[$activeTool]);
-			my $extraLength = $e - $originalE[$activeTool];  # positive if extra length on unretract is used
-			$extraLength = 0 if($extraLength < 0);
-			$originalE[$activeTool] = $e if($e > $originalE[$activeTool]);  # necessary if extraLength > 0
-
-			if($move > 0) {
-				# Assumption: the code will never try something exotic like a partial unretract.
-				# If this is an unretract move, it must be a complete unretract.
-				$move = -$retracted[$activeTool] + $extraLength;
-			}
-			elsif($move < $retracted[$activeTool]) {
-				# If it is a retract move and we're already retracted, ignore unless the retract
-				# is deeper, in that case retract further.
-				$move += -$retracted[$activeTool];
+			# If positive, should correspond to 'extra length on restart' in Slic3r
+			my $extraLength = $e + $retracted[$activeTool];
+			if($extraLength > 0) {
+				$originalE[$activeTool] += $extraLength;
 			}
 			else {
-				$move = 0;
+				$extraLength = 0;
 			}
-			$retracted[$activeTool] += $move;
+
+			if($e > 0) {  # unretract
+				# Assumption: the code will never try something exotic like a partial unretract.
+				# If this is an unretract move, it must be a complete unretract.
+				$e = -$retracted[$activeTool] + $extraLength;
+			}
+			elsif($wiping[$activeTool]) {
+				# The end of a wipe should be a bit of pure retract (5% of the total retract length
+				# in Prusa3D Slic3r 1.38.4), so just leave $e as-is.
+			}
+			elsif($e < $retracted[$activeTool]) {
+				# If it is a retract move, assume that any existing retract was done by this
+				# script, therefore only retract deeper if the original code wants to retract
+				# deeper. This shouldn't happen, but we do allow it.
+				$e = $e - $retracted[$activeTool];
+			}
+			else {
+				$e = 0;
+			}
+			$wiping[$activeTool] = 0;  # A(n un)retract move always signals the end of a wipe
+			$retracted[$activeTool] += $e;
 			$retracted[$activeTool] = 0 if($retracted[$activeTool] > 0);
-			push(@output, sprintf('G1 E%.5f %s', $e + $offsetE[$activeTool], $extra)) if($move);
+			push(@output, sprintf('G1 E%.5f %s', $e, $extra)) if($e);
 		}
 		elsif($line =~ /^M(104|140) S/) {
 			# Temperature changes. Disable always because they need to be performed at a different moment.
@@ -740,10 +782,7 @@ sub outputToolChangeAndPrime
 	my $extrusionScale = $isLayer1 ?
 		$extruScaleL1[$activeTool] * $thickness / $firstLayerHeightDefault :
 		$extruScale[$activeTool] * $thickness / $layerHeightDefault;
-	$offsetE[$activeTool] +=
-		generateSquare($squareX, $squareY,
-		               $originalE[$activeTool] + $offsetE[$activeTool],
-		               $extrusionScale, $isLayer1, 0);
+	$offsetE[$activeTool] += generateSquare($squareX, $squareY, $extrusionScale, $isLayer1, 0);
 	# Do a normal retract. The logic in transformCodeBlock will ensure an unretract when normal code resumes.
 	push(@output, doRetractMove(-$retractLen[$activeTool]) .' ; normal retract');
 	# Wipe the ooze from the deactivated nozzle.
@@ -784,7 +823,6 @@ sub outputTopUpPrimingTower
 		$extruScale[$activeTool] * $thickness / $layerHeightDefault;
 	$offsetE[$activeTool] +=
 		generateSquare($squareX, $squareY,
-		               $originalE[$activeTool] + $offsetE[$activeTool],
 		               $extrusionScale, $isLayer1, $maxPerim, $restoreZTo);
 	# Retract before handing over control to the original code again.
 	# The logic in transformCodeBlock will ensure that an unretract is added when resuming
