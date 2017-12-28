@@ -9,12 +9,12 @@
 #
 # Features:
 # * Minimise the number of tool changes.
-# * Prime nozzle after tool change on a priming tower.
-# * Cool down the unused nozzle. (Do not try to use the ooze prevention temperature drop in Slic3r!
-#     Last time I tried it, it was a bucket of bugs. It didn't even wait for the temperature to
-#     settle.)
+# * Prime nozzle on a priming tower after tool change.
+# * Cool down the unused nozzle. This replaces the ooze prevention temperature drop in Slic3r,
+#     do not bother trying to enable it. Last time I tried it, it was a bucket of bugs.
+#     It didn't even wait for the temperature to settle.
 # * Wipe inactive nozzle on tower before resuming print.
-# * Maintain tower with minimal perimeters when no tool change.
+# * Maintain tower with minimal perimeters when no tool change, unless no more tool changes.
 # * Disable fan during heating and priming.
 #
 # It is recommended to enable a tall skirt because the wipe is not always perfect, and the
@@ -26,6 +26,7 @@
 #
 # This script assumes you are using the custom G-code I published at
 #    https://www.dr-lex.be/info-stuff/print3d-ffcp.html#slice_gcode
+#    or https://www.thingiverse.com/thing:2367350
 #    You could adapt it to your own G-code snippets by modifying the parseInputFile method.
 # This version of the script MUST be used with the latest printer profiles and snippets that
 #   use relative E distances! It will output a dummy gcode file which only prints a message on
@@ -36,13 +37,14 @@
 # Lift Z is now supported. Be sure to use it for inlays (coasters etc.), otherwise travel moves
 #   from the second color printed in the same layer, risk smudging the first color.
 #
-# TODOs: 1. make the priming tower more stable at tall heights, either rotate it 45° or make it
-#           more circular.
-#        2. allow any extruder to be the first one to start printing. This would mean altering
+# TODOs: 1. allow any extruder to be the first one to start printing. This would mean altering
 #           the start G-code, or better: only let Slic3r insert a skeleton for the start G-code,
 #           and the script replaces this with the right bit of code.
-#        3. print our own additional wipe wall in between the tower and the print, to reduce the
-#           need for a tall skirt, which is especially wasteful on large prints.
+#        2. make the priming tower more stable at tall heights, either rotate it 45° or make it
+#           more circular, or maybe make the base wider.
+#        3. print our own additional wipe wall in between the tower and the object, to reduce the
+#           need for a tall skirt, which is especially wasteful on large prints. This could be
+#           automatic: only print it if no skirt was configured.
 #        4. smarter priming tower placement and shifting of the print if necessary to keep
 #           everything on the platform.
 
@@ -76,6 +78,11 @@ my $towerMaintainPerimeters = 2;
 # If you notice considerable lag when the second tool is first primed, increase this number.
 # If it squirts out too much of a blob, reduce it. In my setup, 1.6 proves a good value.
 my $initRetractT1 = 1.6;
+
+# Set to 1 to add a vertical line in the middle of tower maintaining layers (except first layer).
+# This line helps with the first wipe after a set of maintaining layers, and it helps anchor the
+# ooze as well as the next priming layer.
+my $maintainVLine = 1;
 
 # Enable debug output
 my $debug = 0;
@@ -113,6 +120,10 @@ my $layer1FeedRate = 1200;
 
 # This has proven to be a generally good speed to chop off ooze on something else.
 my $wipeFeedRate = 4000;
+
+# This should be slow because the tool change move is not accelerated. Moreover, when using the
+# temperature drop, we have all the time in the world to do the tool change anyway.
+my $toolChangeSpeed = 3200;
 
 # Feedrates for the inner and outer perimeters of the tower respectively. You could tweak the outer
 # rate to more closely match the normal print rate so there won't be a huge pressure difference
@@ -168,7 +179,7 @@ my @squareTravels = (
 [-6.943, -6.943],
 [-7.500, -7.500]
 );
-# This is a 15mm square, with a 8mm hole in the middle.
+# This is a 15mm square, with an 8mm hole in the middle.
 my @squareCoords = (
 [[4.158, -4.158, 0.38517], [4.158, 4.158, 0.38516], [-4.158, 4.158, 0.38517], [-4.158, -4.098, 0.38238]],
 [[4.715, -4.715, 0.43677], [4.715, 4.715, 0.43678], [-4.715, 4.715, 0.43677], [-4.715, -4.655, 0.43400]],
@@ -178,6 +189,12 @@ my @squareCoords = (
 [[6.943, -6.943, 0.64321], [6.943, 6.943, 0.64322], [-6.943, 6.943, 0.64321], [-6.943, -6.883, 0.64043]],
 [[7.500, -7.500, 0.69482], [7.500, 7.500, 0.69482], [-7.500, 7.500, 0.69482], [-7.500, -7.440, 0.69204]]
 );
+
+# Y coordinates for the vertical line in the maintaining layers, if enabled. The first value is for
+# a full layer (towerMaintainPerimeters == 0), the next for 1 perimeter, and so on.
+my @maintainLineYPos = (3.801, 7.043, 6.486, 5.929, 5.372, 4.815, 4.258);
+# The flow rate for the line, in E coordinate per mm.
+my $primingFlowRate = 0.0463213;
 
 
 ###### MAIN ######
@@ -741,7 +758,10 @@ sub outputToolChangeAndPrime
 
 	my $nextTool = ($activeTool == 0 ? 1 : 0);
 	$wipeOffset = ($wipeOffset + 1) % 3;
-	my $yOffset = ($wipeOffset - 1) * 1.5;
+	# This offset should not be too large: keeping it small ensures that the pillars of ooze
+	# created by the heating nozzle, stick together to form one stronger pillar that helps when
+	# wiping the other nozzle.
+	my $yOffset = ($wipeOffset - 1) * 1.75;
 
 	push(@output, '; - - - - - START TOOL CHANGE AND PRIME NOZZLE - - - - -');
 	# Drop the temperature of this nozzle and raise the other
@@ -766,7 +786,7 @@ sub outputToolChangeAndPrime
 	$activeTool = $nextTool;
 	# I have found the M108 command to be utterly irrelevant for the FFCP, but I insert it anyway
 	# in case other scripts rely on it to know the tool has changed.
-	push(@output, ('G1 F5000; speed for tool change.',
+	push(@output, ("G1 F${toolChangeSpeed}; speed for tool change.",
 	               "T${activeTool}; do actual tool swap",
 	               "M108 T${activeTool}",
 	               'G4 P0; flush pipeline'));
@@ -829,6 +849,13 @@ sub outputTopUpPrimingTower
 	$offsetE[$activeTool] +=
 		generateSquare($squareX, $squareY,
 		               $extrusionScale, $isLayer1, $maxPerim, $restoreZTo);
+	if($maintainVLine && !$isLayer1) {
+		my $lineY = $maintainLineYPos[$maxPerim];
+		my $lineE = (2 * $lineY) * $primingFlowRate * $extrusionScale;
+		push(@output, sprintf('G1 X%.3f Y%.3f F%.0f ; print maintaining Y line', $squareX, $squareY + $lineY, $travelFeedRate));
+		push(@output, sprintf('G1 X%.3f Y%.3f E%.5f F%.5f', $squareX, $squareY - $lineY, $lineE, $outerFeedRate));
+		$offsetE[$activeTool] += $lineE;
+	}
 	# Retract before handing over control to the original code again.
 	# The logic in transformCodeBlock will ensure that an unretract is added when resuming
 	# printing, and additional attempts at retracts are ignored.
