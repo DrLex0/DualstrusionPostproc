@@ -798,7 +798,8 @@ sub outputToolChangeAndPrime
 	# by that time that it will no longer ooze. It is actually better not to wait until it has
 	# cooled down entirely, or the wipe may not be successful.
 	# NOTE: the M6 command actually is a combined tool change + wait for heating. To merely wait,
-	# use an M109 command (but, it requires an extra S argument, so I prefer using M6 here).
+	# an M109 command would be appropriate, but it is to avoided: only some recent Sailfish builds
+	# seem to treat it as wait-for-temperature, older ones treat it as M104.
 	push(@output, "M6 T${activeTool} ; wait for extruder to heat up");
 	push(@output, 'G4 P'. int(1000 * $dwell) .' ; wait') if($dwell);
 
