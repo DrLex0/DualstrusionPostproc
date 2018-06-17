@@ -257,11 +257,13 @@ my $previousLayerZ = 0;
 foreach my $layerZ (@layerHeights) {
 	push(@layerThickness, $layerZ - $previousLayerZ);
 	foreach my $key ("0_${layerZ}", "1_${layerZ}") {
-		my $blockListRef = $toolLayers{$key};
-		next if(!$blockListRef);
+		next if(! $toolLayers{$key});
+		my @blockList = @{$toolLayers{$key}};
+		my @fanList = @{$fanState{$key}};
 
 		my @cleanedBlocks;
-		foreach my $blockRef (@{$blockListRef}) {
+		my @cleanedFanState;
+		foreach my $blockRef (@blockList) {
 			my $back = -1;
 			# If the final G1 command is a retract move, drop it.
 			# Limit the search to the last 16 lines.
@@ -272,13 +274,19 @@ foreach my $layerZ (@layerHeights) {
 				}
 				$back--;
 			}
-			push(@cleanedBlocks, $blockRef) if(@{$blockRef});
+			my $fan = shift(@fanList);
+			if(@{$blockRef}) {
+				push(@cleanedBlocks, $blockRef);
+				push(@cleanedFanState, $fan);
+			}
 		}
 		if(@cleanedBlocks) {
 			$toolLayers{$key} = \@cleanedBlocks;
+			$fanState{$key} = \@cleanedFanState;
 		}
 		else {
 			delete $toolLayers{$key};
+			delete $fanState{$key};
 		}
 	}
 	$previousLayerZ = $layerZ;
@@ -659,7 +667,10 @@ sub parseInputFile
 					my $indexTarget = "${activeTool}_${z}";
 					if(defined($toolLayers{$indexToMove})) {
 						logMsg($DEBUG, "  Merging ${indexToMove} into ${indexTarget}");
-						$toolLayers{$indexTarget} = [] if(!defined($toolLayers{$indexTarget}));
+						if(!defined($toolLayers{$indexTarget})) {
+							$toolLayers{$indexTarget} = [];
+							$fanState{$indexTarget} = [];
+						}
 						# Put the snubbed Z move back
 						push($toolLayers{$indexTarget}, ["G1 Z${currentZ} F${travelFeedRate} ; LIFT Z"]);
 						push($toolLayers{$indexTarget}, @{$toolLayers{$indexToMove}});
