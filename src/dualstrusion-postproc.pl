@@ -84,8 +84,6 @@ my $initRetractT1 = 1.6;
 # ooze as well as the next priming layer.
 my $maintainVLine = 1;
 
-# Enable debug output
-my $debug = 0;
 
 #### The variables below should normally not be modified. ####
 
@@ -196,27 +194,46 @@ my @maintainLineYPos = (3.801, 7.043, 6.486, 5.929, 5.372, 4.815, 4.258);
 # The flow rate for the line, in E coordinate per mm.
 my $primingFlowRate = 0.0463213;
 
+# Will be prepended as program identifier to log messages
+my $progId = 'dual-proc';
+
 
 ###### MAIN ######
+my ($DEBUG, $INFO, $WARNING, $ERROR, $FATAL) = (10, 20, 30, 40, 50);
+my %logLevelNames = (10 => 'DEBUG', 20 => 'INFO', 30 => 'WARNING', 40 => 'ERROR', 50 => 'FATAL');
+
+my $logLevel = $INFO;
+
 if($ARGV[0] eq '-d') {
-	$debug = 1;
+	$logLevel = $DEBUG;
 	shift;
 }
 
 my $inFile = shift;
 die "Need input file as argument!\n" if(!$inFile);
 
+my $variableFan = 0;  # If true, use M106/107 commands, otherwise M126/127
 my @extruScale = (1, 1);
 my @extruScaleL1 = (1, 1);
 my (@header, @footer, @layerHeights, @layerThickness);
-# Chunks of code grouped per tool and per layer height. Each layer height may contain multiple groups of code blocks. The key is "${tool}_${layerheight}".
+
+# Chunks of code grouped per tool and per layer height. Each layer height may contain multiple
+# groups of code blocks. The key is "${tool}_${layerheight}".
 my %toolLayers;
 
-my ($minX, $minY, $maxX, $maxY) = parseInputFile($inFile, \@header, \@footer, \%toolLayers, \@layerHeights);
-if($debug) {
-	print STDERR "Found XY bounds as ${minX}~${maxX}, ${minY}~${maxY}\n";
-	print STDERR "Normal extrusion scale factors:  $extruScale[0], $extruScale[1]\n";
-	print STDERR "Layer 1 extrusion scale factors: $extruScaleL1[0], $extruScaleL1[1]\n";
+# The fan speeds at the start of each of the chunks (same key). This will be used to ensure that
+# the fan spins at the correct speed even if chunks are reordered.
+my %fanState;
+
+# Current speed of the fan in the input or output file. We need to keep track of this because the
+# fan should not be enabled during tool change and priming.
+my $fanSpeed = 0;
+
+my ($minX, $minY, $maxX, $maxY) = parseInputFile($inFile);
+if($logLevel <= $DEBUG) {
+	logMsg($DEBUG, "Found XY bounds as ${minX}~${maxX}, ${minY}~${maxY}");
+	logMsg($DEBUG, "Normal extrusion scale factors:  $extruScale[0], $extruScale[1]");
+	logMsg($DEBUG, "Layer 1 extrusion scale factors: $extruScaleL1[0], $extruScaleL1[1]");
 }
 my ($squareX, $squareY) = (($minX + $maxX)/2, $maxY + $squareMargin);
 
@@ -228,13 +245,13 @@ my $wipeOffset = 0;
 # Layer 1 SF = first_layer_height/0.25 * filament_diameter/1.75 * nozzle_diameter/0.4 * extrusion_multiplier
 
 if(!@layerHeights) {
-	print STDERR "This file has no printable content!\n";
+	logMsg($FATAL, 'This file has no printable content!');
 	exit(1);
 }
 
-# Preprocess the code blocks: wipe any retract command or irrelevant junk (comments, whitespace) at
-# the very end, because we'll be replacing these with our own retracts. (Moreover, Slic3r first
-# changes layer and then retracts, so there will be blocks that only have a retract in them.)
+# Preprocess the code blocks: wipe any retract command at the very end, because we'll be replacing
+# these with our own retracts. (Moreover, Slic3r first changes layer and then retracts, so there
+# will be blocks that only have a retract in them.)
 my $lastLayerZ = $layerHeights[-1];
 my $previousLayerZ = 0;
 foreach my $layerZ (@layerHeights) {
@@ -245,18 +262,19 @@ foreach my $layerZ (@layerHeights) {
 
 		my @cleanedBlocks;
 		foreach my $blockRef (@{$blockListRef}) {
-			while(@{$blockRef} && $$blockRef[-1] =~ /^(G1 E\S+ |\s*;|\s*$)/) {
-				pop(@{$blockRef});  # zap final retract, empty lines, and comment junk
+			my $back = -1;
+			# If the final G1 command is a retract move, drop it.
+			# Limit the search to the last 16 lines.
+			while(@{$blockRef} && $back >= -16) {
+				if($$blockRef[$back] =~ /^G1 +(\S+)/) {
+					splice(@{$blockRef}, $back, 1) if($1 =~ /^E/);
+					last;
+				}
+				$back--;
 			}
 			push(@cleanedBlocks, $blockRef) if(@{$blockRef});
 		}
 		if(@cleanedBlocks) {
-			# Strip any M127 command from the very last code block so it won't disable the fan
-			# if the ordering changes and the final layer of the other material is yet to be
-			# printed. The end G-code or the printer will disable the fan anyway.
-			if($layerZ == $lastLayerZ) {
-				pop(@{$cleanedBlocks[-1]}) if(${$cleanedBlocks[-1]}[-1] =~ /^M127($|\s|;)/);
-			}
 			$toolLayers{$key} = \@cleanedBlocks;
 		}
 		else {
@@ -266,7 +284,7 @@ foreach my $layerZ (@layerHeights) {
 	$previousLayerZ = $layerZ;
 }
 
-# Assumption: we always start with T0 and always print a skirt on layer 1.
+# Assumption: we always start with T0 and always print a skirt on layer 1 (TODO: remove this restriction!)
 # Even if there is no T0 material in the first layer, Slic3r will print a skirt with T0 and then swap tools.
 # If this ever changes or the user deems a skirt unnecessary, this script might break.
 my $activeTool = 0;
@@ -288,17 +306,31 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 		$activeTool = $otherTool;
 	}
 }
-print STDERR "Highest tool change at layer ${highestToolChangeN}, Z=${highestToolChangeZ}\n" if($debug);
+logMsg($DEBUG, "Highest tool change at layer ${highestToolChangeN}, Z=${highestToolChangeZ}");
 
 $activeTool = 0;
-my @originalE = (0, 0);  # How much was extruded by the original file at the current input line. Only interesting for statistics.
-my @offsetE   = (0, 0);  # The offset we're adding, i.e. how much extra filament my extra code has pushed out. Only interesting for statistics.
-my @retracted = (0, -$initRetractT1);  # How far the extruders are currently retracted (regardless of done by the original code, or mine). These values can only be negative or 0.
-my @wiping = (0, 0);  # Whether a wipe move was last seen on this extruder, necessary to correctly handle retractions during wiping.
-my $fanEnabled = 0;  # The fan should not be enabled during tool change and priming.
+
+# How much was extruded by the original file at the current input line. Only interesting for
+# statistics.
+my @originalE = (0, 0);
+
+# The offset we're adding, i.e. how much extra filament my extra code has pushed out. Only
+# interesting for statistics.
+my @offsetE   = (0, 0);
+
+# How far the extruders are currently retracted (regardless of done by the original code, or mine).
+# These values can only be negative or 0.
+my @retracted = (0, -$initRetractT1);
+
+# Whether a wipe move was last seen on this extruder, necessary to correctly handle retractions
+# during wiping.
+my @wiping = (0, 0);
+
+$fanSpeed = 0;
 
 push(@header, sprintf('M104 S%d T%d ; heat T1 to standby temperature while T0 starts',
                       $temperature[1] - $temperatureDrop, 1));
+my $hNum = 1+$#header;
 
 # Reassemble the file in optimal order and insert retractions and priming code where necessary.
 # For every layer:
@@ -314,19 +346,23 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 	my $layerZ = $layerHeights[$layerId];
 	my $nextLayerZ = ($layerId < $#layerHeights ? $layerHeights[$layerId + 1] : 0);
 
-	printf STDERR "LAYER %d: ${layerZ}, thickness %.6g\n", (1 + $layerId, $layerThickness[$layerId]) if($debug);
+	logMsg($DEBUG, sprintf("LAYER %d: ${layerZ}, thickness %.6g [%d]",
+	                       1 + $layerId, $layerThickness[$layerId], $hNum+$#output));
 	# Check what tools are active in this layer and the next.
 	my (@activeToolBlocks, @otherToolBlocks);
+	my (@activeFanState, @otherFanState);
 	my $otherTool = ($activeTool == 0 ? 1 : 0);
 	if($toolLayers{"${activeTool}_${layerZ}"}) {
 		foreach my $ref (@{$toolLayers{"${activeTool}_${layerZ}"}}) {
 			push(@activeToolBlocks, $ref);
 		}
+		@activeFanState = @{$fanState{"${activeTool}_${layerZ}"}};
 	}
 	if($toolLayers{"${otherTool}_${layerZ}"}) {
 		foreach my $ref (@{$toolLayers{"${otherTool}_${layerZ}"}}) {
 			push(@otherToolBlocks, $ref);
 		}
+		@otherFanState = @{$fanState{"${otherTool}_${layerZ}"}};
 	}
 	# Optimisation: if the next layer will start with the other tool, do not top up the tower
 	# but prime the next tool instead.
@@ -335,8 +371,11 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 	push(@output, doRetractMove(-$retractLen[$activeTool]) .' ; normal retract1') unless($retracted[$activeTool]);
 	push(@output, sprintf('G1 Z%.3f F%d ; LAYER %d', $layerZ, $travelFeedRate, 1 + $layerId));
 	if(@activeToolBlocks) {
-		print STDERR "  CONTINUE WITH ACTIVE TOOL $activeTool: ". (1+$#activeToolBlocks) ." BLOCKS\n" if($debug);
+		logMsg($DEBUG,
+		       "  CONTINUE WITH ACTIVE TOOL $activeTool: ". (1+$#activeToolBlocks) .' BLOCKS ['.
+		       ($hNum+$#output) .']');
 		for(my $i=0; $i<=$#activeToolBlocks; $i++) {
+			ensureFanSpeed($activeFanState[$i]);
 			outputTransformedCode($activeToolBlocks[$i]);
 			if($i < $#activeToolBlocks && !$retracted[$activeTool]) {
 				push(@output, doRetractMove(-$retractLen[$activeTool]) .' ; normal retract2');
@@ -345,15 +384,22 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 	}
 	if($layerZ <= $highestToolChangeZ) {
 		if(!@otherToolBlocks && $toolStillActiveNextLayer && $layerZ < $highestToolChangeZ) {
-			print STDERR "  TOP UP PRIMING TOWER\n" if($debug);
+			logMsg($DEBUG, '  TOP UP PRIMING TOWER ['. ($hNum+$#output) .']');
 			outputTopUpPrimingTower($isLayer1, $layerThickness[$layerId], $layerZ);
 		}
 		else {
-			print STDERR "  SWITCH TO OTHER TOOL $otherTool\n" if($debug);
-			print STDERR "  AND PRINT ". (1+$#otherToolBlocks) ." BLOCKS\n" if($debug);
+			if($logLevel <= $DEBUG) {
+				logMsg($DEBUG, "  SWITCH TO OTHER TOOL ${otherTool}");
+				# Number of tool blocks can be 0, see if() above
+				logMsg($DEBUG, '  AND PRINT '. (1+$#otherToolBlocks) .' BLOCKS ['.
+				       ($hNum+$#output) .']');
+			}
+			# The tool change code will restore $fanSpeed as a final step.
+			$fanSpeed = $otherFanState[0] if(@otherFanState);
 			push(@output, doRetractMove(-$retractLenTC[$activeTool]) .' ; tool change retract');
 			outputToolChangeAndPrime($isLayer1, $layerThickness[$layerId], $layerZ);
 			for(my $i=0; $i<=$#otherToolBlocks; $i++) {
+				ensureFanSpeed($otherFanState[$i]) if($i > 0);
 				outputTransformedCode($otherToolBlocks[$i]);
 				if($i < $#otherToolBlocks && !$retracted[$activeTool]) {
 					push(@output, doRetractMove(-$retractLen[$activeTool]) .' ; normal retract3');
@@ -373,15 +419,75 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 	}
 }
 
+push(@output, doRetractMove(-$retractLen[$activeTool]) .' ; end of print retract') if(! $retracted[$activeTool]);
+ensureFanSpeed(0, '; end of print fan off');
 print join("\n", (@header, @output, @footer)) ."\n";
 
 
 
 ###### SUBROUTINES ######
+sub logMsg
+# Disadvantage of this fancy logging method: log messages will be interpolated even if they won't
+# be printed.
+{
+	my ($level, $msg) = @_;
+	return if($level < $logLevel);
+	my $levelStr = $logLevelNames{$level};
+	print STDERR "[${progId}] ${levelStr}: ${msg}\n";
+}
+
+sub updateFanSpeed
+# Set current fanSpeed according to commands found in the line.
+{
+	my $line = shift;
+	if($line =~ /^M126(?:$|\s|;)/) {
+		if($variableFan) {
+			logMsg($WARNING,
+				   'found an M126 command even though the file uses M106/127 commands. Ignoring.');
+		}
+		else {
+			$fanSpeed = 1;
+		}
+	}
+	elsif($line =~ /^M127(?:$|\s|;)/) {
+		if($variableFan) {
+			logMsg($WARNING,
+				   'found an M127 command even though the file uses M106/127 commands. Ignoring.');
+		}
+		else {
+			$fanSpeed = 0;
+		}
+	}
+	elsif($line =~ /^M106(?:$|;|\s+S(\d*\.?\d+)|\s)/) {
+		$fanSpeed = $1 ? $1 : 0;
+	}
+	elsif($line =~ /^M107(?:$|\s|;)/) {
+		$fanSpeed = 0;
+	}
+}
+
+sub ensureFanSpeed
+# If current $fanSpeed differs from target, add a G-code line to @output and update $fanSpeed.
+{
+	my $target = shift;
+	my $comment = shift;
+	$comment = 'restore previous fan state' if(! defined($comment));
+	$comment = $comment ? "; ${comment}" : '';
+	return if($fanSpeed == $target);
+
+	if($variableFan) {
+		push(@output, sprintf("M106 S%0.2f${comment}", $target));
+	}
+	else {
+		push(@output, ($target ? 'M126' : 'M127') . ${comment});
+	}
+	$fanSpeed = $target;
+}
+
 sub parseInputFile
 # Chop up the file into header, footer, and code blocks grouped per layer and per tool.
 # Returns print bounds.
-# Requires @header, @footer, @layerHeights, and %toolLayers to be declared.
+# Requires @header, @footer, @layerHeights, %toolLayers, and %fanState to be declared.
 {
 	my $fName = shift;
 	open(my $fHandle, '<', $fName) or die "FAIL: cannot read file: $!";
@@ -496,7 +602,7 @@ sub parseInputFile
 			next;
 		}
 
-		if($line =~ /^G1 X(\S+) Y(\S+) /) {  # Regular print or travel move
+		if($line =~ /^G1 X(\S+) Y(\S+)( |$)/) {  # Regular print or travel move
 			$minX = $1 if($1 < $minX);
 			$maxX = $1 if($1 > $maxX);
 			$minY = $2 if($2 < $minY);
@@ -517,11 +623,16 @@ sub parseInputFile
 			$activeTool = $1;
 			die "ERROR: more than 2 tools not supported.\n" if($activeTool > 1);
 			if($previousTool == $activeTool) {
-				print STDERR "WARNING: tool change to same tool detected at line ${lineNumber}, ignoring\n";
+				logMsg($DEBUG,
+				       "ignoring tool change to same tool ${activeTool} at line ${lineNumber}");
 				next;
 			}
-			$toolLayers{"${activeTool}_${currentZ}"} = [] if(!defined($toolLayers{"${activeTool}_${currentZ}"}));
+			if(!defined($toolLayers{"${activeTool}_${currentZ}"})) {
+				$toolLayers{"${activeTool}_${currentZ}"} = [];
+				$fanState{"${activeTool}_${currentZ}"} = []
+			}
 			push($toolLayers{"${activeTool}_${currentZ}"}, []);  # Start a new block
+			push($fanState{"${activeTool}_${currentZ}"}, $fanSpeed);
 			$toolLayerRef = $toolLayers{"${activeTool}_${currentZ}"}[-1];
 			next;
 		}
@@ -530,11 +641,12 @@ sub parseInputFile
 			next if($z == $currentZ);  # For some reason Slic3r repeats G1 Zz commands even if the layer does not change.
 			if($z < $currentZ) {
 				# Z went down again, meaning this must have been a 'lift Z'. Undo the presumed last layer change.
-				print STDERR "LIFT Z detected at z=$z\n" if($debug);
+				logMsg($DEBUG, "LIFT Z detected at z=${z}");
 				$layerNumber--;
 				pop(@layerHeights);
 				if($layerHeights[-1] != $z) {
-					print STDERR "WARNING: Z returned to different height after Z-hop, this makes no sense and things will probably go awry\n";
+					logMsg($WARNING,
+					       'Z returned to different height after Z-hop, this makes no sense and things will probably go awry');
 				}
 				# We do want to preserve this Z move
 				push(@{$toolLayerRef}, $line);
@@ -546,12 +658,13 @@ sub parseInputFile
 					my $indexToMove = "${activeTool}_${currentZ}";
 					my $indexTarget = "${activeTool}_${z}";
 					if(defined($toolLayers{$indexToMove})) {
-						print STDERR "  Merging ${indexToMove} into ${indexTarget}\n" if($debug);
+						logMsg($DEBUG, "  Merging ${indexToMove} into ${indexTarget}");
 						$toolLayers{$indexTarget} = [] if(!defined($toolLayers{$indexTarget}));
 						# Put the snubbed Z move back
 						push($toolLayers{$indexTarget}, ["G1 Z${currentZ} F${travelFeedRate} ; LIFT Z"]);
 						push($toolLayers{$indexTarget}, @{$toolLayers{$indexToMove}});
 						delete($toolLayers{$indexToMove});
+						delete($fanState{$indexToMove});
 					}
 				}
 				$currentZ = $z;
@@ -563,27 +676,41 @@ sub parseInputFile
 				push(@layerHeights, $currentZ);
 			}
 
-			$toolLayers{"${activeTool}_${currentZ}"} = [] if(!defined($toolLayers{"${activeTool}_${currentZ}"}));
+			if(!defined($toolLayers{"${activeTool}_${currentZ}"})) {
+				$toolLayers{"${activeTool}_${currentZ}"} = [];
+				$fanState{"${activeTool}_${currentZ}"} = [];
+			}
 			push($toolLayers{"${activeTool}_${currentZ}"}, []);  # Start a new block
+			push($fanState{"${activeTool}_${currentZ}"}, $fanSpeed);
 			$toolLayerRef = $toolLayers{"${activeTool}_${currentZ}"}[-1];
 			next;
+		}
+		elsif($line =~ /^M10[67]($| |;)/) {
+			$variableFan = 1;
+			updateFanSpeed($line);
+		}
+		elsif($line =~ /^M12[67]($| |;)/ && ! ($isHeaderPart1 || $isFooter)) {
+			updateFanSpeed($line);
 		}
 
 		push(@{$toolLayerRef}, $line) if(!$inToolChangeCode); 
 	}
 	if(!($filaDiamOK && $nozzleDiamOK && $extruMultiOK)) {
-		print STDERR "WARNING: not all extrusion parameters could be parsed from the file.\nExtrusion values may be wrong. Check the input file!\n";
+		logMsg($WARNING,
+		       'not all extrusion parameters could be parsed from the file. Extrusion values may be wrong. Check the input file!');
 	}
 	if(!@temperature || $#temperature < 1 || !@first_layer_temperature || $#first_layer_temperature < 1) {
-		print STDERR "FATAL: could not find 'temperature' and/or 'first_layer_temperature' values in the file, these are essential to avoid utter and complete b0rk.\n";
+		logMsg($FATAL,
+		       'could not find "temperature" and/or "first_layer_temperature" values in the file, these are essential to avoid utter and complete b0rk.');
 		exit(1);
 	}
 	if(!$relativeEOK) {
-		print STDERR "FATAL: The input file does not specify relative E coordinates in its start G-code, this is required for the dualstrusion post-processing script.\n";
+		logMsg($FATAL,
+		       'The input file does not specify relative E coordinates in its start G-code, this is required for the dualstrusion post-processing script.');
 		exit(1);
 	}
 
-	print STDERR "Found a total of ${layerNumber} layers\n" if($debug);
+	logMsg($DEBUG, "Found a total of ${layerNumber} layers");
 	return ($minX, $minY, $maxX, $maxY);
 }
 
@@ -740,12 +867,7 @@ sub outputTransformedCode
 			next;
 		}
 		else {  # Anything else
-			if($line =~ /^M126($|\s|;)/) {
-				$fanEnabled = 1;
-			}
-			elsif($line =~ /^M127($|\s|;)/) {
-				$fanEnabled = 0;
-			}
+			updateFanSpeed($line) if($line =~ /^M1[02][67]/);
 			push(@output, $line);
 		}
 	}
@@ -764,6 +886,7 @@ sub outputToolChangeAndPrime
 	my $yOffset = ($wipeOffset - 1) * 1.75;
 
 	push(@output, '; - - - - - START TOOL CHANGE AND PRIME NOZZLE - - - - -');
+
 	# Drop the temperature of this nozzle and raise the other
 	my $newTemperature = $isLayer1 ? $first_layer_temperature[$nextTool] : $temperature[$nextTool];
 	push(@output, "M104 S${newTemperature} T${nextTool} ; heat active nozzle");
@@ -781,6 +904,8 @@ sub outputToolChangeAndPrime
 	push(@output, sprintf('G1 X%.3f Y%.3f F%d', $squareX, $squareY + $yOffset, $travelFeedRate));
 	push(@output, sprintf('G1 Z%.3f F%d', $layerZ, $travelFeedRate)) if($doLift);
 
+	push(@output, 'M106 0; disable fan') if($variableFan && $fanSpeed);
+
 	# Do the tool swap. Use workaround to do the move at a reasonable speed, because it is not accelerated.
 	# TODO: I could parse the original tool change code from the file, and fill in the template.
 	$activeTool = $nextTool;
@@ -790,10 +915,12 @@ sub outputToolChangeAndPrime
 	               "T${activeTool}; do actual tool swap",
 	               "M108 T${activeTool}",
 	               'G4 P0; flush pipeline'));
-	# Only disable the fan now, because Sailfish has the stupid habit of anticipating this command
-	# for several seconds and possibly already disabling the fan while we might still be printing
-	# a difficult overhang.
-	push(@output, 'M127; disable fan') if($fanEnabled);
+	if(! $variableFan && $fanSpeed) {
+		# Only disable the fan now, because Sailfish has the stupid habit of anticipating M12[67]
+		# commands for several seconds and possibly already disabling the fan while we might still
+		# be printing a difficult overhang.
+		push(@output, 'M127; disable fan');
+	}
 	# Only wait for the active nozzle to heat. The inactive nozzle should have cooled down enough
 	# by that time that it will no longer ooze. It is actually better not to wait until it has
 	# cooled down entirely, or the wipe may not be successful.
@@ -813,9 +940,19 @@ sub outputToolChangeAndPrime
 	push(@output, doRetractMove(-$retractLen[$activeTool]) .' ; normal retract');
 	# Wipe the ooze from the deactivated nozzle.
 	push(@output, sprintf('G1 X%.3f Y%.3f F%d', $squareX, $squareY + $yOffset, $travelFeedRate));
-	# Again, the fan would enable way earlier than I would like it to, therefore block it with a
-	# pipeline flush. Enable the fan before the wipe move, so it has some time to spin up.
-	push(@output, ('G4 P0', 'M126; re-enable fan')) if($fanEnabled);
+
+	if($fanSpeed) {
+		if($variableFan) {
+			push(@output, sprintf("M106 S%0.2f; re-enable fan", $fanSpeed));
+		}
+		else {
+			# Again, the fan would enable way earlier than I would like it to, therefore block it
+			# with a pipeline flush. Enable the fan before the wipe move, so it has some time to
+			# spin up.
+			push(@output, ('G4 P0', 'M126; re-enable fan'));
+		}
+	}
+
 	my $move = $nozzleDistance;
 	$move *= -1 if($activeTool == 1);
 	push(@output, sprintf('G1 X%.3f Y%.3f F%d ; wipe nozzle on tower',
