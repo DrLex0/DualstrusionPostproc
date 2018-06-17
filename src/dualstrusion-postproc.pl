@@ -1,6 +1,6 @@
 #!/usr/bin/perl -w
 # Dualstrusion post-processing script for Slic3r output and a Replicator Dual-like printer.
-# Version: 0.6
+# Version: 0.7
 # Alexander Thomas a.k.a. DrLex, https://www.dr-lex.be/
 # Released under Creative Commons Attribution 4.0 International license.
 #
@@ -29,13 +29,12 @@
 #    or https://www.thingiverse.com/thing:2367350
 #    You could adapt it to your own G-code snippets by modifying the parseInputFile method.
 # This version of the script MUST be used with the latest printer profiles and snippets that
-#   use relative E distances! It will output a dummy gcode file which only prints a message on
-#   the LCD if this condition is not met.
+#   use relative E distances! It will exit with an error if this condition is not met.
 # Variable layer heights are allowed. It should also work with supports printed at layer heights
 #   different from the object's, but this is not recommended as it will incur additional tool
 #   changes. You should enable 'Synchronize with object layers' in Slic3r.
 # Lift Z is now supported. Be sure to use it for inlays (coasters etc.), otherwise travel moves
-#   from the second color printed in the same layer, risk smudging the first color.
+#   from the second color printed in the same layer risk smudging the first color.
 #
 # TODOs: 1. allow any extruder to be the first one to start printing. This would mean altering
 #           the start G-code, or better: only let Slic3r insert a skeleton for the start G-code,
@@ -256,7 +255,8 @@ my $lastLayerZ = $layerHeights[-1];
 my $previousLayerZ = 0;
 foreach my $layerZ (@layerHeights) {
 	push(@layerThickness, $layerZ - $previousLayerZ);
-	foreach my $key ("0_${layerZ}", "1_${layerZ}") {
+	foreach my $tool (0, 1) {
+		my $key = "${tool}_${layerZ}";
 		next if(! $toolLayers{$key});
 		my @blockList = @{$toolLayers{$key}};
 		my @fanList = @{$fanState{$key}};
@@ -510,6 +510,8 @@ sub parseInputFile
 	my $lineNumber = 0;
 
 	my ($filaDiamOK, $nozzleDiamOK, $extruMultiOK, $relativeEOK) = (0) x 4;
+	# Last tool change command seen before start of actual print, default to 0 like Slic3r.
+	my $startTool = 0;
 
 	foreach my $line (<$fHandle>) {
 		$lineNumber++;
@@ -535,6 +537,14 @@ sub parseInputFile
 			if($line =~ /^G1 Z(\S+)([ ;]|$)/) {
 				$isHeaderPart2 = 0;
 				# Do not skip, leave it up to the layer change statement below to handle this.
+			}
+			elsif($line =~ /^(?:M108 +)?T(\d+)/) {
+				# TODO: when allowing to start with T1, these commands should be removed because
+				# the start code will already set up the desired tool.
+				# NOTE: if there is T0 and T1 in the first layer and only T0 in the next two
+				# layers, then it makes the most sense to start with T1 (Slic3r currently isn't
+				# smart enough to do this).
+				$startTool = $1;
 			}
 			else {
 				push(@header, $line);
@@ -718,6 +728,12 @@ sub parseInputFile
 	if(!$relativeEOK) {
 		logMsg($FATAL,
 		       'The input file does not specify relative E coordinates in its start G-code, this is required for the dualstrusion post-processing script.');
+		exit(1);
+	}
+
+	if($startTool != 0) {
+		logMsg($FATAL,
+		       'This script does not yet support starting a print with the left extruder (T1). A simple workaround is to add a small object printed with T0 in the first layer.');
 		exit(1);
 	}
 
