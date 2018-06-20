@@ -216,12 +216,15 @@ my @extruScale = (1, 1);
 my @extruScaleL1 = (1, 1);
 my (@header, @footer, @layerHeights, @layerThickness);
 
-# Chunks of code grouped per tool and per layer height. Each layer height may contain multiple
-# groups of code blocks. The key is "${tool}_${layerheight}".
+# Chunks of code grouped per tool and per layer height. The key is "${tool}_${layerheight}".
+# Each item in this hash refers to an anonymous array that contains references to arrays
+# (blocks) of G-code lines.
 my %toolLayers;
 
-# The fan speeds at the start of each of the chunks (same key). This will be used to ensure that
-# the fan spins at the correct speed even if chunks are reordered.
+# Fan speeds at the start of each of the code blocks within each chunk (same key). This will be
+# used to ensure that the fan spins at the correct speed even if chunks are reordered. Each item
+# in this hash refers to an anonymous array containing exactly as many elements as the array of
+# the same key in %toolLayers.
 my %fanState;
 
 # Current speed of the fan in the input or output file. We need to keep track of this because the
@@ -260,6 +263,14 @@ foreach my $layerZ (@layerHeights) {
 		next if(! $toolLayers{$key});
 		my @blockList = @{$toolLayers{$key}};
 		my @fanList = @{$fanState{$key}};
+		if($#blockList != $#fanList) {
+			logMsg($ERROR,
+			       'Assertion failure: number of code blocks ('. (1+$#blockList) .
+			       ') does not match number of fan states ('. (1+$#fanList) .
+			       '). You should probably file a bug including your input file.');
+			logMsg($ERROR,
+			       'Continuing, although you should not trust the output file to be correct.');
+		}
 
 		my @cleanedBlocks;
 		my @cleanedFanState;
@@ -273,6 +284,7 @@ foreach my $layerZ (@layerHeights) {
 					last;
 				}
 				$back--;
+				last if(-$back > @$blockRef);
 			}
 			my $fan = shift(@fanList);
 			if(@{$blockRef}) {
@@ -361,15 +373,11 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 	my (@activeFanState, @otherFanState);
 	my $otherTool = ($activeTool == 0 ? 1 : 0);
 	if($toolLayers{"${activeTool}_${layerZ}"}) {
-		foreach my $ref (@{$toolLayers{"${activeTool}_${layerZ}"}}) {
-			push(@activeToolBlocks, $ref);
-		}
+		@activeToolBlocks = @{$toolLayers{"${activeTool}_${layerZ}"}};
 		@activeFanState = @{$fanState{"${activeTool}_${layerZ}"}};
 	}
 	if($toolLayers{"${otherTool}_${layerZ}"}) {
-		foreach my $ref (@{$toolLayers{"${otherTool}_${layerZ}"}}) {
-			push(@otherToolBlocks, $ref);
-		}
+		@otherToolBlocks = @{$toolLayers{"${otherTool}_${layerZ}"}};
 		@otherFanState = @{$fanState{"${otherTool}_${layerZ}"}};
 	}
 	# Optimisation: if the next layer will start with the other tool, do not top up the tower
@@ -663,15 +671,16 @@ sub parseInputFile
 				$layerNumber--;
 				pop(@layerHeights);
 				if($layerHeights[-1] != $z) {
-					logMsg($WARNING,
-					       'Z returned to different height after Z-hop, this makes no sense and things will probably go awry');
+					logMsg($ERROR,
+					       'Z returned to different height after Z-hop, this makes no sense and things will probably go awry.');
 				}
 				# We do want to preserve this Z move
 				push(@{$toolLayerRef}, $line);
  
-				# Append any blocks in the presumed layer to the last real layer.
-				# This is probably overkill because I don't expect there to be anything else than a single block
-				# with a single travel move, but since performance of this script is irrelevant, I go for safety.
+				# Append any blocks in the presumed layer to the last real layer. This is probably
+				# overkill because I don't expect there to be anything else than a single block
+				# with a single travel move, but since performance of this script is unimportant,
+				# I go for safety.
 				foreach my $tool (0, 1) {
 					my $indexToMove = "${activeTool}_${currentZ}";
 					my $indexTarget = "${activeTool}_${z}";
@@ -681,9 +690,15 @@ sub parseInputFile
 							$toolLayers{$indexTarget} = [];
 							$fanState{$indexTarget} = [];
 						}
-						# Put the snubbed Z move back
-						push($toolLayers{$indexTarget}, ["G1 Z${currentZ} F${travelFeedRate} ; LIFT Z"]);
-						push($toolLayers{$indexTarget}, @{$toolLayers{$indexToMove}});
+						# Restore the snubbed Z move. Because of the cumbersome data structures,
+						# simplest is to create an extra block for this.
+						push($toolLayers{$indexTarget},
+						     (["G1 Z${currentZ} F${travelFeedRate} ; LIFT Z"],
+							  @{$toolLayers{$indexToMove}}));
+						# Of course each of these 2 blocks needs its own fanState
+						push($fanState{$indexTarget},
+						     (${$fanState{$indexToMove}}[0],
+						      @{$fanState{$indexToMove}}));
 						delete($toolLayers{$indexToMove});
 						delete($fanState{$indexToMove});
 					}
@@ -931,7 +946,7 @@ sub outputToolChangeAndPrime
 	push(@output, sprintf('G1 X%.3f Y%.3f F%d', $squareX, $squareY + $yOffset, $travelFeedRate));
 	push(@output, sprintf('G1 Z%.3f F%d', $layerZ, $travelFeedRate)) if($doLift);
 
-	push(@output, 'M106 0; disable fan') if($variableFan && $fanSpeed);
+	push(@output, 'M106 S0; disable fan') if($variableFan && $fanSpeed);
 
 	# Do the tool swap. Use workaround to do the move at a reasonable speed, because it is not accelerated.
 	# TODO: I could parse the original tool change code from the file, and fill in the template.
@@ -970,7 +985,7 @@ sub outputToolChangeAndPrime
 
 	if($fanSpeed) {
 		if($variableFan) {
-			push(@output, sprintf("M106 S%0.2f; re-enable fan", $fanSpeed));
+			push(@output, sprintf('M106 S%0.2f; re-enable fan', $fanSpeed));
 		}
 		else {
 			# Again, the fan would enable way earlier than I would like it to, therefore block it
