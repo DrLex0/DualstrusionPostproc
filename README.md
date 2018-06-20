@@ -1,7 +1,7 @@
 # Dualstrusion-Postproc
 *Post-processing script for high-quality dual extrusion on 3D printers like the FlashForge Creator Pro*<br>
 by Alexander Thomas, aka Dr. Lex<br>
-Current version: 0.6<br>
+Current version: 0.7<br>
 Contact: visit https://www.dr-lex.be/lexmail.html<br>
 &nbsp;&nbsp;&nbsp;&nbsp;or use my gmail address "doctor.lex".
 
