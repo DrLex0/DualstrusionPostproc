@@ -1,6 +1,6 @@
 #!/usr/bin/perl -w
 # Dualstrusion post-processing script for Slic3r output and a Replicator Dual-like printer.
-# Version: 0.7
+# Version: 0.8
 # Alexander Thomas a.k.a. DrLex, https://www.dr-lex.be/
 # Released under Creative Commons Attribution 4.0 International license.
 #
@@ -657,8 +657,8 @@ sub parseInputFile
 				$toolLayers{"${activeTool}_${currentZ}"} = [];
 				$fanState{"${activeTool}_${currentZ}"} = []
 			}
-			push($toolLayers{"${activeTool}_${currentZ}"}, []);  # Start a new block
-			push($fanState{"${activeTool}_${currentZ}"}, $fanSpeed);
+			push(@{$toolLayers{"${activeTool}_${currentZ}"}}, []);  # Start a new block
+			push(@{$fanState{"${activeTool}_${currentZ}"}}, $fanSpeed);
 			$toolLayerRef = $toolLayers{"${activeTool}_${currentZ}"}[-1];
 			next;
 		}
@@ -692,11 +692,11 @@ sub parseInputFile
 						}
 						# Restore the snubbed Z move. Because of the cumbersome data structures,
 						# simplest is to create an extra block for this.
-						push($toolLayers{$indexTarget},
+						push(@{$toolLayers{$indexTarget}},
 						     (["G1 Z${currentZ} F${travelFeedRate} ; LIFT Z"],
 							  @{$toolLayers{$indexToMove}}));
 						# Of course each of these 2 blocks needs its own fanState
-						push($fanState{$indexTarget},
+						push(@{$fanState{$indexTarget}},
 						     (${$fanState{$indexToMove}}[0],
 						      @{$fanState{$indexToMove}}));
 						delete($toolLayers{$indexToMove});
@@ -716,8 +716,8 @@ sub parseInputFile
 				$toolLayers{"${activeTool}_${currentZ}"} = [];
 				$fanState{"${activeTool}_${currentZ}"} = [];
 			}
-			push($toolLayers{"${activeTool}_${currentZ}"}, []);  # Start a new block
-			push($fanState{"${activeTool}_${currentZ}"}, $fanSpeed);
+			push(@{$toolLayers{"${activeTool}_${currentZ}"}}, []);  # Start a new block
+			push(@{$fanState{"${activeTool}_${currentZ}"}}, $fanSpeed);
 			$toolLayerRef = $toolLayers{"${activeTool}_${currentZ}"}[-1];
 			next;
 		}
