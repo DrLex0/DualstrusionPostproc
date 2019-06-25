@@ -32,8 +32,15 @@ Then, either manually invoke it to process gcode files as follows (remember: nev
 ```
 ./dualstrusion-postproc.pl input.gcode > output.gcode
 ```
-Or, use a wrapper script that does the above and configure that wrapper script in each of your Print Settings in Slic3r (*Output options* → *Post-processing scripts*).  
-If you use my Slic3r configs and workflow, edit the `make_fcp_x3g` script so it contains the correct path to this script.
+Or, use a wrapper script that does the above and configure that wrapper script in each of your Print Settings in Slic3r (*Output options* → *Post-processing scripts*).
+
+If you use my Slic3r configs and workflow, edit the `make_fcp_x3g` script so it contains the correct path to this script:
+ 1. Open file using favorite text editor
+ 2. Look for `DUALSTRUDE_SCRIPT` . Replace the filepath (in bash-form, not Windows) with that of the downloaded Perl file. 
+ 3. If not using the MVF system, search for `PWM_SCRIPT` ; replace the line with `PWM_SCRIPT= #/Users/athomas/bin/pwm_postprocessor.py`. If you are using the MVF system, correct the filepath with the path to the script, ensuring that the file is indeed executable.
+4. Ensure that the Perl file has executable permissions (go to the containing folder, do `ls -l`, make sure it is executable by the current user). If not, `chmod +x dualstrusion-postproc.pl`
+5. Go to PrusaSlicer, navigate to Printer Settings, Start G-code
+      - Replace with Start G-code found here: [My GCodeSnippets Repo](https://raw.githubusercontent.com/DrLex0/FFCP-GCodeSnippets/master/Slic3r-GCode/Start-dual-extruders-postproc.gcode)
 
 You can configure the `make_fcp_x3g` script to keep a copy of the unprocessed code as a copy with “`_orig`” appended to the name. This allows to manually run the script again with different settings in case you want to change something without re-exporting the G-code file from Slic3r.
 
