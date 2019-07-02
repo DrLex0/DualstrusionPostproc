@@ -47,8 +47,12 @@ It is recommended to enable a tall skirt that reaches at least up to the last la
 
 Currently, the script will place the tower behind the print without considering the print bed size or trying to shift things around, so make sure there is enough room (at least 22 mm) behind your print before exporting it. This means you won't be able to do huge dual extrusions that take up the entire bed, but the risk of those failing is pretty high anyway.
 
+**Caution:** currently there is a limitation that there must be something touching the build plate (in other words, in the first layer) that is printed with the *right* extruder (*extruder ‘1’* in PrusaSlicer). If this is not the case and you don't want to swap your filaments, a simple workaround is to add some tiny object and assign it to extruder 1. (Fixing this is high on my priority list, but it requires significant changes.)
+
+Another limitation is that the wipe and prime tower is likely to be knocked over when printing something very tall. Anything that has 2 materials above 60mm is likely to be risky.
+
 ## Notes
-The script is specifically written for Slic3r. It might be possible to adapt it to other slicers (like Simplify3D) but this will require making the parsing routines more robust (they are lazily written to work with typical Slic3r style output only) and maybe also changes to the logic. Contributions to make the script usable with other slicers are welcome!
+The script is specifically written for PrusaSlicer / Slic3r. It might be possible to adapt it to other slicers (like Simplify3D) but this will require making the parsing routines more robust (they are lazily written to work with typical Slic3r style output only) and maybe also changes to the logic. Contributions to make the script usable with other slicers are welcome!
 
 ## License
 This script is released under a Creative Commons Attribution 4.0 International license.
