@@ -560,8 +560,9 @@ sub parseInputFile
 	# This code will fail for printers with a print bed larger than 65 metres. Too bad.
 	my ($minX, $minY, $maxX, $maxY) = (32768, 32768, -32768, -32768);
 
-	# Reference to the anonymous array inside %toolLayers to which we're currently appending code lines
-	my $toolLayerRef;
+	# Reference to the anonymous array inside %toolLayers to which we're currently appending code
+	# lines, as well as the previous one
+	my ($toolLayerRef, $previousLayerRef);
 	my $lineNumber = 0;
 
 	my ($filaDiamOK, $nozzleDiamOK, $extruMultiOK, $relativeEOK) = (0) x 4;
@@ -722,6 +723,7 @@ sub parseInputFile
 			}
 			push(@{$toolLayers{"${activeTool}_${currentZ}"}}, []);  # Start a new block
 			push(@{$fanState{"${activeTool}_${currentZ}"}}, $fanSpeed);
+			$previousLayerRef = $toolLayerRef;
 			$toolLayerRef = $toolLayers{"${activeTool}_${currentZ}"}[-1];
 			next;
 		}
@@ -781,6 +783,7 @@ sub parseInputFile
 			}
 			push(@{$toolLayers{"${activeTool}_${currentZ}"}}, []);  # Start a new block
 			push(@{$fanState{"${activeTool}_${currentZ}"}}, $fanSpeed);
+			$previousLayerRef = $toolLayerRef;
 			$toolLayerRef = $toolLayers{"${activeTool}_${currentZ}"}[-1];
 			next;
 		}
@@ -791,8 +794,17 @@ sub parseInputFile
 		elsif($line =~ /^M12[67]($| |;)/ && ! ($zone == 0 || $zone == 4)) {
 			updateFanSpeed($line);
 		}
+		elsif($line =~ /^M1(04|40) /) {
+			# Temperature change commands M104 (extruder) or M140 (bed): disable because we'll
+			# insert our own. Also move them to the previous block if there is nothing yet in
+			# this block, so we don't end up with a block having only these commented-out lines
+			# that could mess up the initial tool choice.
+			my $ref = ($previousLayerRef && !@$toolLayerRef) ? $previousLayerRef : $toolLayerRef;
+			push(@{$ref}, ";${line} ; DISABLED, will be reinserted at the right location");
+			next;
+		}
 
-		push(@{$toolLayerRef}, $line) if($zone != 101); 
+		push(@$toolLayerRef, $line) if($zone != 101); 
 	}
 	if(!($filaDiamOK && $nozzleDiamOK && $extruMultiOK)) {
 		logMsg($WARNING,
@@ -955,10 +967,6 @@ sub outputTransformedCode
 			$retracted[$activeTool] += $e;
 			$retracted[$activeTool] = 0 if($retracted[$activeTool] > 0);
 			push(@output, sprintf('G1 E%.5f %s', $e, $extra)) if($e);
-		}
-		elsif($line =~ /^M(104|140) S/) {
-			# Temperature changes. Disable always because they need to be performed at a different moment.
-			push(@output, ";${line} ; DISABLED, will be reinserted at the right location");
 		}
 		elsif($line =~ /^M108 T/) {
 			# Drop these to avoid any confusion, our own tool change code will insert this where appropriate
