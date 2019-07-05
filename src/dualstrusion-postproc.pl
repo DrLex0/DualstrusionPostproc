@@ -1,7 +1,8 @@
-#!/usr/bin/perl -w
-# Dualstrusion post-processing script for Slic3r output and a Replicator Dual-like printer.
-# Version: 0.8
+#!/usr/bin/perl
+# Dualstrusion post-processing script for PrusaSlicer output and a Replicator Dual-like printer.
+# Version: 1.0
 # Alexander Thomas a.k.a. DrLex, https://www.dr-lex.be/
+# GitHub project: https://github.com/DrLex0/DualstrusionPostproc
 # Released under Creative Commons Attribution 4.0 International license.
 #
 # Usage: dualstrusion-postproc.pl [-d] input.gcode > output.gcode
@@ -21,13 +22,10 @@
 # active nozzle will ooze during the travel move from the tower to the print. This skirt only
 # needs to reach up to the last layer that has two materials.
 #
-# Limitation: the print must start with the right extruder (T0). Otherwise things will go haywire.
-#   If need be, add a dummy object to the first layer and assign it to the right extruder.
-#
 # This script assumes you are using the custom G-code I published at
 #    https://www.dr-lex.be/info-stuff/print3d-ffcp.html#slice_gcode
 #    or https://www.thingiverse.com/thing:2367350
-#    You could adapt it to your own G-code snippets by modifying the parseInputFile method.
+# You can adapt it to your own G-code snippets by modifying the MARK variables.
 # This version of the script MUST be used with the latest printer profiles and snippets that
 #   use relative E distances! It will exit with an error if this condition is not met.
 # Variable layer heights are allowed. It should also work with supports printed at layer heights
@@ -36,18 +34,21 @@
 # Lift Z is now supported. Be sure to use it for inlays (coasters etc.), otherwise travel moves
 #   from the second color printed in the same layer risk smudging the first color.
 #
-# TODOs: 1. allow any extruder to be the first one to start printing. This would mean altering
-#           the start G-code, or better: only let Slic3r insert a skeleton for the start G-code,
-#           and the script replaces this with the right bit of code.
-#        2. make the priming tower more stable at tall heights, either rotate it 45° or make it
+# TODOs: 1. make the priming tower more stable at tall heights, either rotate it 45° or make it
 #           more circular, or maybe make the base wider.
-#        3. print our own additional wipe wall in between the tower and the object, to reduce the
+#        2. print our own additional wipe wall in between the tower and the object, to reduce the
 #           need for a tall skirt, which is especially wasteful on large prints. This could be
 #           automatic: only print it if no skirt was configured.
-#        4. smarter priming tower placement and shifting of the print if necessary to keep
+#        3. smarter priming tower placement and shifting of the print if necessary to keep
 #           everything on the platform.
+#
+# DISCLAIMER: use at your own risk. The author is not responsible for damage to your printer or
+#   other accidents due to the use of this script.
 
 use strict;
+use warnings;
+
+#### Configurable options ####
 
 # This should be 34 for the FFCP unless you hacked it big time.
 my $nozzleDistance = 34;
@@ -72,19 +73,28 @@ my $dwell = 0;
 # Two perimeters should be sufficient. Set to 0 to always print a full layer.
 my $towerMaintainPerimeters = 2;
 
-# Assume the unused tool to be retracted this far. This should be at least the normal retraction
-# distance for this extruder, plus some extra to combat the typical initial extrusion lag.
-# If you notice considerable lag when the second tool is first primed, increase this number.
-# If it squirts out too much of a blob, reduce it. In my setup, 1.6 proves a good value.
-my $initRetractT1 = 1.6;
+# Assume the unused tool to be retracted this much beyond its normal retraction. This can be used
+# to combat the typical initial extrusion lag. If you notice considerable lag when the second tool
+# is first primed, increase this number. If it squirts out too much of a blob, reduce it. In my
+# setup, 0.6 proves a good value.
+my $initRetractX = 0.6;
 
 # Set to 1 to add a vertical line in the middle of tower maintaining layers (except first layer).
 # This line helps with the first wipe after a set of maintaining layers, and it helps anchor the
 # ooze as well as the next priming layer.
 my $maintainVLine = 1;
 
+# Markers for begin and/or end of G-code chunks as configured in PrusaSlicer.
+# The lines must start exactly like this, but can end with anything.
+my $MARK_START_CODE_BEGIN = ';- - - Custom G-code for dual extruder printing';
+my $MARK_END_CODE_BEGIN   = ';- - - Custom finish printing G-code';
+my $MARK_TOOLCHANGE_BEGIN = ';- - - Custom G-code for tool change';
+my $MARK_TOOLCHANGE_END   = ';- - - End custom G-code for tool change';
+
 
 #### The variables below should normally not be modified. ####
+
+my $version = '1.0';
 
 # The factor between mm/s values as used by Slic3r, and the feed rates as specified in the G-code.
 my $feedRateMultiplier = 60; 
@@ -107,8 +117,8 @@ my @extrusion_multipliers = (1.0, 1.0);
 # bail out if it doesn't find them.
 my @temperature;
 my @first_layer_temperature;
-# We don't really need first_layer, but parse it anyway to omit the heat command if it is the same.
-my ($bed_temperature, $first_layer_bed_temperature);
+my @first_layer_bed_temperature;
+my @bed_temperature;
 
 # These should also be parsed although these defaults should be sensible.
 my $travelFeedRate = 8400;
@@ -214,9 +224,10 @@ die "Need input file as argument!\n" if(!$inFile);
 my $variableFan = 0;  # If true, use M106/107 commands, otherwise M126/127
 my @extruScale = (1, 1);
 my @extruScaleL1 = (1, 1);
-my (@header, @footer, @layerHeights, @layerThickness);
+my (@header, @start, @footer, @layerHeights, @layerThickness);
 
-# Chunks of code grouped per tool and per layer height. The key is "${tool}_${layerheight}".
+# Chunks of code grouped per tool and per layer height. The key is "${tool}_${layerheight}"
+# with the layerHeight value matching an element in @layerHeights.
 # Each item in this hash refers to an anonymous array that contains references to arrays
 # (blocks) of G-code lines.
 my %toolLayers;
@@ -256,6 +267,9 @@ if(!@layerHeights) {
 # will be blocks that only have a retract in them.)
 my $lastLayerZ = $layerHeights[-1];
 my $previousLayerZ = 0;
+my $layerId = 0;
+my $startTool;
+
 foreach my $layerZ (@layerHeights) {
 	push(@layerThickness, $layerZ - $previousLayerZ);
 	foreach my $tool (0, 1) {
@@ -301,22 +315,34 @@ foreach my $layerZ (@layerHeights) {
 			delete $fanState{$key};
 		}
 	}
+
+	# Determine optimal start tool: the one that minimises number of tool changes.
+	# In case of a tie, prefer T0.
+	if(! defined($startTool)) {
+		if(! $toolLayers{"0_${layerZ}"}) {
+			$startTool = (1 + $layerId) % 2;
+		}
+		elsif(! $toolLayers{"1_${layerZ}"}) {
+			$startTool = $layerId % 2;
+		}
+	}
+
 	$previousLayerZ = $layerZ;
+	$layerId++;
 }
 
-# Assumption: we always start with T0 and always print a skirt on layer 1 (TODO: remove this restriction!)
-# Even if there is no T0 material in the first layer, Slic3r will print a skirt with T0 and then swap tools.
-# If this ever changes or the user deems a skirt unnecessary, this script might break.
-my $activeTool = 0;
-my ($highestToolChangeZ, $highestToolChangeN) = (0, 0);
+$startTool = 0 if(! defined($startTool));
+logMsg($DEBUG, "Starting with tool ${startTool}");
+my $activeTool = $startTool;
 
 # Find the highest layer that has a tool change. For this, we mimic the logic of the processing
 # below, because trying to find a single formula for this is bad for mental sanity, mostly because
 # of the $toolStillActiveNextLayer optimisation.
-for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
+my ($highestToolChangeZ, $highestToolChangeN) = (0, 0);
+for($layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 	my $layerZ = $layerHeights[$layerId];
 	my $nextLayerZ = ($layerId < $#layerHeights ? $layerHeights[$layerId + 1] : 0);
-	my $otherTool = ($activeTool == 0 ? 1 : 0);
+	my $otherTool = otherT($activeTool);
 
 	my $hasOtherTool = defined($toolLayers{"${otherTool}_${layerZ}"});
 	my $toolStillActiveNextLayer = defined($toolLayers{"${activeTool}_${nextLayerZ}"}) || $nextLayerZ == 0;
@@ -328,7 +354,13 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 }
 logMsg($DEBUG, "Highest tool change at layer ${highestToolChangeN}, Z=${highestToolChangeZ}");
 
-$activeTool = 0;
+$activeTool = $startTool;
+my $nextTool = otherT($startTool);
+
+# The material (extruder) index that determines bed temperature.
+# Like Slic3r, pick 0 if T0 is active in first layer, 1 otherwise.
+my $bed_material = ($toolLayers{"0_$layerHeights[0]"} ? 0 : 1);
+logMsg($DEBUG, "Material ${bed_material} determines bed temperature");
 
 # How much was extruded by the original file at the current input line. Only interesting for
 # statistics.
@@ -339,8 +371,9 @@ my @originalE = (0, 0);
 my @offsetE   = (0, 0);
 
 # How far the extruders are currently retracted (regardless of done by the original code, or mine).
-# These values can only be negative or 0.
-my @retracted = (0, -$initRetractT1);
+# These values must only be negative or 0.
+my @retracted = (0, 0);
+$retracted[$nextTool] = -$retractLen[$nextTool] - $initRetractX;
 
 # Whether a wipe move was last seen on this extruder, necessary to correctly handle retractions
 # during wiping.
@@ -348,8 +381,9 @@ my @wiping = (0, 0);
 
 $fanSpeed = 0;
 
-push(@header, sprintf('M104 S%d T%d ; heat T1 to standby temperature while T0 starts',
-                      $temperature[1] - $temperatureDrop, 1));
+push(@start,
+	sprintf('M104 S%d T%d ; heat T%d to standby temperature while T%d starts',
+	        $temperature[$nextTool] - $temperatureDrop, $nextTool, $nextTool, $startTool));
 my $hNum = 1+$#header;
 
 # Reassemble the file in optimal order and insert retractions and priming code where necessary.
@@ -361,6 +395,7 @@ my $hNum = 1+$#header;
 # If there is no other tool in this layer and this tool is in the next layer, top up priming tower.
 #   Else: swap and prime, and print any blocks of the other tool in this layer.
 my @output;
+
 for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 	my $isLayer1 = ($layerId == 0);
 	my $layerZ = $layerHeights[$layerId];
@@ -371,7 +406,7 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 	# Check what tools are active in this layer and the next.
 	my (@activeToolBlocks, @otherToolBlocks);
 	my (@activeFanState, @otherFanState);
-	my $otherTool = ($activeTool == 0 ? 1 : 0);
+	my $otherTool = otherT($activeTool);
 	if($toolLayers{"${activeTool}_${layerZ}"}) {
 		@activeToolBlocks = @{$toolLayers{"${activeTool}_${layerZ}"}};
 		@activeFanState = @{$fanState{"${activeTool}_${layerZ}"}};
@@ -429,15 +464,22 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 		if($newTemp != $first_layer_temperature[$activeTool]) {
 			push(@output, "M104 S${newTemp} T${activeTool} ; change to regular extrusion temperature");
 		}
-		if($bed_temperature != $first_layer_bed_temperature) {
-			push(@output, "M140 S${bed_temperature} ; set regular bed temperature");
+		my $newBedTemp = $bed_temperature[$bed_material];
+		if($newBedTemp != $first_layer_bed_temperature[$bed_material]) {
+			push(@output, "M140 S${newBedTemp} ; set regular bed temperature");
 		}
 	}
 }
 
 push(@output, doRetractMove(-$retractLen[$activeTool]) .' ; end of print retract') if(! $retracted[$activeTool]);
 ensureFanSpeed(0, '; end of print fan off');
-print join("\n", (@header, @output, @footer)) ."\n";
+
+print join("\n",
+	@header,
+	generateStartCode($startTool, $bed_material),
+	@start,
+	@output,
+	@footer) ."\n";
 
 
 
@@ -450,6 +492,12 @@ sub logMsg
 	return if($level < $logLevel);
 	my $levelStr = $logLevelNames{$level};
 	print STDERR "[${progId}] ${levelStr}: ${msg}\n";
+}
+
+sub otherT
+# The other tool than the given one
+{
+	return shift == 0 ? 1 : 0;
 }
 
 sub updateFanSpeed
@@ -503,12 +551,11 @@ sub ensureFanSpeed
 sub parseInputFile
 # Chop up the file into header, footer, and code blocks grouped per layer and per tool.
 # Returns print bounds.
-# Requires @header, @footer, @layerHeights, %toolLayers, and %fanState to be declared.
+# Requires @header, @start, @footer, @layerHeights, %toolLayers, and %fanState to be declared.
 {
 	my $fName = shift;
 	open(my $fHandle, '<', $fName) or die "FAIL: cannot read file: $!";
 
-	my ($isHeaderPart1, $isHeaderPart2, $isFooter, $inToolChangeCode) = (1, 0, 0, 0);
 	my ($currentZ, $layerNumber, $activeTool) = (0) x 3;
 	# This code will fail for printers with a print bed larger than 65 metres. Too bad.
 	my ($minX, $minY, $maxX, $maxY) = (32768, 32768, -32768, -32768);
@@ -518,49 +565,63 @@ sub parseInputFile
 	my $lineNumber = 0;
 
 	my ($filaDiamOK, $nozzleDiamOK, $extruMultiOK, $relativeEOK) = (0) x 4;
-	# Last tool change command seen before start of actual print, default to 0 like Slic3r.
-	my $startTool = 0;
 
+	my $zone = 0;  # 100 = main G-code, 101 = tool change code
 	foreach my $line (<$fHandle>) {
 		$lineNumber++;
 		chomp($line);
 
-		if($isHeaderPart1) {
-			# First unconditionally treat everything up to the "@body" marker as header.
-			if($line =~ /;\@body(\s|;|$)/) {
-				$isHeaderPart1 = 0;
-				$isHeaderPart2 = 1;
-			}
-			elsif($line =~ /^M83(;|\s|$)/) {
+		if($zone < 4) {
+			if($line =~ /^M83(;|\s|$)/) {
 				$relativeEOK = 1;
 			}
 			elsif($line =~ /^M82(;|\s|$)/) {
 				$relativeEOK = 0;
 			}
+		}
+
+		if($zone == 0) {
+			# Everything up to the start code marker, add to @header
+			if($line =~ /^\Q${MARK_START_CODE_BEGIN}\E/) {
+				$zone = 1;
+			}
 			push(@header, $line);
 			next;
 		}
-		elsif($isHeaderPart2) {
-			# Then look for the point where the main code has 'moved' to the first layer height.
+		elsif($zone == 1) {
+			# All the initial comment lines of the start G-code, add to @header
+			if($line !~ /^\s*(;.*)?$/) {
+				$zone = 2;
+				next;
+			}
+			push(@header, $line);
+			next;
+		}
+		elsif($zone == 2) {
+			# The actual start G-code: discard and ignore entirely, we'll insert our own.
+			# Consider the GPX '@body' marker as the end of the start code.
+			$zone = 3 if($line =~ /;s*\@body(\s|;|$)/);
+			next;
+		}
+		elsif($zone == 3) {
+			# Up the point where the main code has 'moved' to the first layer height, add to @start
 			if($line =~ /^G1 Z(\S+)([ ;]|$)/) {
-				$isHeaderPart2 = 0;
+				$zone = 100;
 				# Do not skip, leave it up to the layer change statement below to handle this.
 			}
 			elsif($line =~ /^(?:M108 +)?T(\d+)/) {
-				# TODO: when allowing to start with T1, these commands should be removed because
-				# the start code will already set up the desired tool.
-				# NOTE: if there is T0 and T1 in the first layer and only T0 in the next two
-				# layers, then it makes the most sense to start with T1 (Slic3r currently isn't
-				# smart enough to do this).
-				$startTool = $1;
+				$activeTool = $1;
+				# Drop these commands because the start code will set up the tool.
+				next;
 			}
 			else {
-				push(@header, $line);
+				push(@start, $line);
 				next;
 			}
 		}
-		elsif($isFooter || $line =~ /^;- - - Custom finish printing G-code/) {
-			$isFooter = 1;
+		elsif($zone == 4 || $line =~ /^\Q${MARK_END_CODE_BEGIN}\E/) {
+			# End of the print, add to @footer
+			$zone = 4;
 			push(@footer, $line);
 			# Use the OK flags to avoid adjusting the factors multiple times, should the file
 			# contain copy-pasted junk.
@@ -609,11 +670,13 @@ sub parseInputFile
 			elsif($line =~ /^; temperature = (.+)/ ) {
 				@temperature = split(/,/, $1);
 			}
-			elsif($line =~ /^; first_layer_bed_temperature = (\d+)/ ) {
-				$first_layer_bed_temperature = $1;
+			elsif($line =~ /^; first_layer_bed_temperature = (.+)/ ) {
+				@first_layer_bed_temperature = split(/,/, $1);
+				push(@first_layer_bed_temperature, $1) if($#first_layer_bed_temperature < 1);
 			}
-			elsif($line =~ /^; bed_temperature = (\d+)/ ) {
-				$bed_temperature = $1;
+			elsif($line =~ /^; bed_temperature = (.+)/ ) {
+				@bed_temperature = split(/,/, $1);
+				push(@bed_temperature, $1) if($#bed_temperature < 1);
 			}
 			elsif($line =~ /^; travel_speed = (\d*\.?\d+)/ ) {
 				$travelFeedRate = $1 * $feedRateMultiplier;
@@ -634,13 +697,13 @@ sub parseInputFile
 			$minY = $2 if($2 < $minY);
 			$maxY = $2 if($2 > $maxY);
 		}
-		elsif($line =~ /^;- - - Custom G-code for tool change/) {
+		elsif($line =~ /^\Q${MARK_TOOLCHANGE_BEGIN}\E/) {
 			# Skip these blocks because we're going to replace them entirely
-			$inToolChangeCode = 1;
+			$zone = 101;
 			next;
 		}
-		elsif($line =~ /^;- - - End custom G-code for tool change/ ) {
-			$inToolChangeCode = 0;
+		elsif($line =~ /^\Q${MARK_TOOLCHANGE_END}\E/ ) {
+			$zone = 100;
 			next;
 		}
 
@@ -725,11 +788,11 @@ sub parseInputFile
 			$variableFan = 1;
 			updateFanSpeed($line);
 		}
-		elsif($line =~ /^M12[67]($| |;)/ && ! ($isHeaderPart1 || $isFooter)) {
+		elsif($line =~ /^M12[67]($| |;)/ && ! ($zone == 0 || $zone == 4)) {
 			updateFanSpeed($line);
 		}
 
-		push(@{$toolLayerRef}, $line) if(!$inToolChangeCode); 
+		push(@{$toolLayerRef}, $line) if($zone != 101); 
 	}
 	if(!($filaDiamOK && $nozzleDiamOK && $extruMultiOK)) {
 		logMsg($WARNING,
@@ -743,12 +806,6 @@ sub parseInputFile
 	if(!$relativeEOK) {
 		logMsg($FATAL,
 		       'The input file does not specify relative E coordinates in its start G-code, this is required for the dualstrusion post-processing script.');
-		exit(1);
-	}
-
-	if($startTool != 0) {
-		logMsg($FATAL,
-		       'This script does not yet support starting a print with the left extruder (T1). A simple workaround is to add a small object printed with T0 in the first layer.');
 		exit(1);
 	}
 
@@ -833,7 +890,6 @@ sub outputTransformedCode
 # output file.
 {
 	my $codeRef = shift;
-	my $inactiveTool = ($activeTool == 0 ? 1 : 0);
 
 	foreach my $line (@{$codeRef}) {
 		if($line =~ /^G1 X\S+ Y\S+ E(\S+)($|;.*|\s.*)/) {
@@ -920,7 +976,7 @@ sub outputToolChangeAndPrime
 {
 	my ($isLayer1, $thickness, $layerZ) = @_;
 
-	my $nextTool = ($activeTool == 0 ? 1 : 0);
+	my $nextTool = otherT($activeTool);
 	$wipeOffset = ($wipeOffset + 1) % 3;
 	# This offset should not be too large: keeping it small ensures that the pillars of ooze
 	# created by the heating nozzle, stick together to form one stronger pillar that helps when
@@ -1041,4 +1097,133 @@ sub outputTopUpPrimingTower
 	# printing, and additional attempts at retracts are ignored.
 	push(@output, doRetractMove(-$retractLen[$activeTool]) .' ; normal retract');
 	push(@output, '; - - - - - END MAINTAINING PRIMING TOWER - - - - -');
+}
+
+sub generateStartCode
+# Produce appropriate start G-code for a print that starts with the given tool number.
+{
+	my ($toolNum, $bedMaterial) = @_;
+	my $bedTemp = $first_layer_bed_temperature[$bedMaterial];
+	my ($firstTemp, $firstHeight) = ($first_layer_temperature[$toolNum], $layerHeights[0]);
+	my $out;
+
+	if($toolNum == 0) {
+		# Tool T0 = extruder 1 in PrusaSlicer = right extruder
+
+		$out = <<__END__;
+; Overridden by dualstrusion-postproc.pl v${version} right extruder start G-code
+T0; set primary extruder
+; We will not prime the left extruder here, that will happen through the priming tower.
+M73 P0; enable show build progress
+M140 S${bedTemp}; heat bed up to first layer temperature
+__END__
+
+		$out .= <<'__END__';  # no interpolation for this chunk
+M104 S140 T0; preheat right nozzle to 140 degrees, this should not cause oozing
+M104 S140 T1; preheat left nozzle to 140 degrees, this should not cause oozing
+; T1 will remain at 140 degrees so it does not ooze all across the first layer(s) while T0 is printing.
+; The post-processing script will take care of heating it to the full temperature.
+M127; disable fan
+G21; set units to mm
+M320; acceleration enabled for all commands that follow
+G162 X Y F8400; home XY axes maximum
+G161 Z F1500; roughly home Z axis minimum
+G92 X118 Y72.5 Z0 E0 B0; set (rough) reference point (also set E and B to make GPX happy). This will be overridden by the M132 below but ensures correct visualisation in some programs.
+G1 Z5 F1500; move the bed down again
+G4 P0; Wait for command to finish
+G161 Z F100; accurately home Z axis minimum
+M132 X Y Z A B; Recall stored home offsets (accurate reference point which you can configure in the printer's LCD menu).
+G90; set positioning to absolute
+M83; use relative E coordinates
+G1 Z20 F1500; move Z to waiting height
+G1 X140 Y65 F1500; do a slow small move to allow acceleration to be gently initialised
+G1 X-70 Y-83 F8400; move to waiting position (front left corner of print bed
+M18 A B; disable extruder steppers while heating
+__END__
+
+		$out .= <<__END__;
+M190 S${bedTemp}; Wait for bed to heat up. Leave extruders at 140C, to avoid cooking the filament.
+; Set 1st nozzle heater to first layer temperature and wait for it to heat.
+; Do not use M116: we do not want to wait for T1 because its temperature is currently irrelevant.
+; Do not use M109: some versions of Sailfish treat it like M104 and do not wait, again demonstrating the horrible lack of standardisation in G-code.
+M104 S${firstTemp} T0
+M6 T0; This is actually tool change + wait for heating, but we are already at T0.
+M17; re-enable all steppers
+G1 Z0 F1500
+G1 X-70 Y-74 F4000; chop off any ooze on the front of the bed
+G1 Z${firstHeight} F1500; move to first layer height
+__END__
+
+		$out .= <<'__END__';  # no interpolation for this chunk
+G1 X121 E24 F2000; extrude a line of filament across the front edge of the bed using right extruder
+; Note how we extrude a little beyond the bed, this produces a tiny loop that makes it easier to remove the extruded strip.
+G1 Y-71 F2000
+G1 X108 Y-74 F4000; cross the extruded line to close the loop
+G1 X100 F4000; wipe across the line (X direction)
+G1 X90 Y-79 F6000; Move back for an additional wipe (Y direction)
+G1 F8400; in case Slic3r would not override this, ensure fast travel to first print move
+M73 P1 ;@body (notify GPX body has started)
+__END__
+	}
+	else {
+		# Tool T1 = extruder 2 in PrusaSlicer = left extruder
+
+		$out = <<__END__;
+; Overridden by dualstrusion-postproc.pl v${version} left extruder start G-code
+T0; start with the right extruder. We will switch to T1 after having moved the print head to provide enough space for the nozzle offset. T0 will be primed by the priming tower.
+M73 P0; enable show build progress
+M140 S${bedTemp}; heat bed up to first layer temperature
+__END__
+
+		$out .= <<'__END__';  # no interpolation for this chunk
+M104 S140 T0; preheat right nozzle to 140 degrees, this should not cause oozing
+M104 S140 T1; preheat left nozzle to 140 degrees, this should not cause oozing
+; T0 will remain at 140 degrees so it does not ooze all across the first layer(s) while T1 is printing.
+; The post-processing script will take care of heating it to the full temperature.
+M127; disable fan
+G21; set units to mm
+M320; acceleration enabled for all commands that follow
+G162 X Y F8400; home XY axes maximum
+G161 Z F1500; roughly home Z axis minimum
+G92 X118 Y72.5 Z0 E0 B0; set (rough) reference point (also set E and B to make GPX happy). This will be overridden by the M132 below but ensures correct visualisation in some programs.
+G1 Z5 F1500; move the bed down again
+G4 P0; Wait for command to finish
+G161 Z F100; accurately home Z axis minimum
+M132 X Y Z A B; Recall stored home offsets (accurate reference point which you can configure in the printer's LCD menu).
+G90; set positioning to absolute
+M83; use relative E coordinates
+G1 Z20 F1500; move Z to waiting height
+G1 X140 Y65 F1500; do a slow small move to allow acceleration to be gently initialised
+G1 X70 Y-83 F8400; move to waiting position (front right corner of print bed), also makes room for the tool change
+; In theory, Sailfish should combine the T1 with the next move. I have tried to make this work many times and I found it extremely unreliable, therefore I force an explicit tool swap as follows.
+G1 F4000; set speed for tool change, keep it low because not accelerated.
+T1; switch to the left extruder
+G4 P0; flush pipeline
+M18 A B; disable extruder steppers while heating
+__END__
+
+		$out .= <<__END__;
+M190 S${bedTemp}; Wait for bed to heat up. Leave extruder at 140C, to avoid cooking the filament.
+M104 S${firstTemp} T1; set nozzle heater to first layer temperature
+M116; wait for everything to reach target temperature
+M17 B; re-enable left extruder stepper
+G1 Z0 F1000
+G1 X70 Y-74 F4000; chop off any ooze on the front of the bed
+G1 Z${firstHeight} F1500; move to first layer height
+__END__
+
+		$out .= <<'__END__';  # no interpolation for this chunk
+G1 X-121 E24 F2000; extrude a line of filament across the front edge of the bed (3mm from the front edge)
+; Note how we extrude a little beyond the bed, this produces a tiny loop that makes it easier to remove the extruded strip.
+G1 Y-71 F2000
+G1 X-108 Y-74 F4000; cross the extruded line to close the loop
+G1 X-100 F4000; wipe across the line (X direction)
+G1 X-90 Y-79 F6000; Move back for an additional wipe (Y direction)
+G1 F8400; in case Slic3r would not override this, ensure fast travel to first print move
+M73 P1 ;@body (notify GPX body has started)
+__END__
+	}
+
+	chomp($out);
+	return $out;
 }

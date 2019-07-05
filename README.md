@@ -1,7 +1,7 @@
 # Dualstrusion-Postproc
 *Post-processing script for high-quality dual extrusion on 3D printers like the FlashForge Creator Pro*<br>
 by Alexander Thomas, aka Dr. Lex<br>
-Current version: 0.8<br>
+Current version: 1.0<br>
 Contact: visit <https://www.dr-lex.be/lexmail.html><br>
 &nbsp;&nbsp;&nbsp;&nbsp;or use my gmail address "doctor.lex".
 
@@ -9,7 +9,7 @@ Contact: visit <https://www.dr-lex.be/lexmail.html><br>
 ## What is it?
 See <https://www.dr-lex.be/info-stuff/print3d-dualstrusion.html> for more information.
 
-This is a Perl script that transforms G-code as produced by Slic3r into more optimal code for creating high-quality dual extrusion prints with printers similar to the FlashForge Creator Pro (running Sailfish firmware), which have two extruders on a single carriage. It avoids that the deactivated nozzle oozes across the print, and it primes the active extruder before resuming printing.
+This is a Perl script that transforms G-code as produced by PrusaSlicer (Slic3r) into more optimal code for creating high-quality dual extrusion prints with printers similar to the FlashForge Creator Pro (running Sailfish firmware), which have two extruders on a single carriage. It avoids that the deactivated nozzle oozes across the print, and it primes the active extruder before resuming printing.
 
 In a nutshell, this script:
 1. maintains a priming/wiping tower behind the printed object,
@@ -24,7 +24,9 @@ This script is *not* plug-and-play, unless you use the workflow and configuratio
 ## Installing and using
 Since version 0.6, the script will only work with relative E distances. This must be enabled in your printer profile, which should be the case if you use [my latest configurations and G-code](https://www.thingiverse.com/thing:2367215).
 
-The script looks for specific markers that occur in my own start and tool change G-code snippets, as provided in the above links. You can use the script with your own G-code of course, but you will need to either edit the `parseInputFile` function to detect your own comment lines in the code, or modify your G-code to include the same markers this function looks for. The start G-code must ensure that tool 0 (the right extruder) is preheated and ready for printing.
+The script looks for specific markers that occur in my own start and tool change G-code snippets, as provided in the above links. You can use the script with your own G-code of course, but you will need to either edit the `MARK` variables to detect your own comment lines in the code, or modify your G-code to include the same markers this function looks for.
+
+The actual start G-code does not matter because it will be overridden by the script. The only requirements is that it starts with the value of `$MARK_START_CODE_BEGIN`, and ends with a line that ends with “`;@body`”.
 
 ### Deploying the script
 
@@ -34,10 +36,7 @@ Then, either:
   `./dualstrusion-postproc.pl input.gcode > output.gcode`
 * or, use a wrapper script that does the above and configure that wrapper script in each of your Print Settings in Slic3r (*Output options* → *Post-processing scripts*).
 
-If you use [my PrusaSlicer configs and workflow](https://www.thingiverse.com/thing:2367215) with the `make_fcp_x3g` wrapper script, you must do two things, assuming you have already set up the configs and that script according to their [instructions](https://www.dr-lex.be/info-stuff/print3d-ffcp.html#slice_config):
-
-1. Open the `make_fcp_x3g` script in an editor of your choice and uncomment the line starting with `DUALSTRUDE_SCRIPT`. Set its value to the full path of the `dualstrusion-postproc.pl` file inside your Linux or OS X environment.
-2. In PrusaSlicer, *Printer Settings:* replace the start G-code of all the dual extrusion (“LR”) profiles with the content of the `Start-dual-extruders-postproc.gcode` file from [my G-code snippets](https://www.thingiverse.com/thing:2367350/files). Remember to repeat this whenever you update the config bundle.
+If you use [my PrusaSlicer configs and workflow](https://www.thingiverse.com/thing:2367215) with the `make_fcp_x3g` wrapper script, first make sure you have set up the configs and that script according to their [instructions](https://www.dr-lex.be/info-stuff/print3d-ffcp.html#slice_config). Then, open the `make_fcp_x3g` script in an editor of your choice and uncomment the line starting with `DUALSTRUDE_SCRIPT`. Set its value to the full path of the `dualstrusion-postproc.pl` file inside your Linux or OS X environment.
 
 You can configure the `make_fcp_x3g` script to keep a copy of the unprocessed code as a copy with “`_orig`” appended to the name. This allows to manually run the script again with different settings in case you want to change something without re-exporting the G-code file from Slic3r.
 
@@ -45,14 +44,16 @@ You can configure the `make_fcp_x3g` script to keep a copy of the unprocessed co
 
 It is recommended to enable a tall skirt that reaches at least up to the last layer that contains two materials. Again, see the main article for more information.
 
-Currently, the script will place the tower behind the print without considering the print bed size or trying to shift things around, so make sure there is enough room (at least 22 mm) behind your print before exporting it. This means you won't be able to do huge dual extrusions that take up the entire bed, but the risk of those failing is pretty high anyway.
+Currently the script will place the tower behind the print without considering the bed size or trying to shift things around, so make sure there is enough room (at least 22 mm) behind your print before exporting it. This means you won't be able to do huge dual extrusions that take up the entire bed, but the risk of those failing is pretty high anyway.
 
-**Caution:** currently there is a limitation that there must be something touching the build plate (in other words, in the first layer) that is printed with the *right* extruder (*extruder ‘1’* in PrusaSlicer). If this is not the case and you don't want to swap your filaments, a simple workaround is to add some tiny object and assign it to extruder 1. (Fixing this is high on my priority list, but it requires significant changes.)
+The bed temperature will be set according to the material in the right extruder, unless there is only material from the left extruder in the first layer, then it will be according to the left extruder material.
 
-Another limitation is that the wipe and prime tower is likely to be knocked over when printing something very tall. Anything that has 2 materials above 60mm is likely to be risky.
+So far I have only tested this with not very tall prints. I suspect that the wipe/prime tower is likely to be knocked over when printing something very tall. Anything that has 2 materials above 60mm is likely to be risky. Improving wipe tower stability is on my TODO list.
 
 ## Notes
 The script is specifically written for PrusaSlicer / Slic3r. It might be possible to adapt it to other slicers (like Simplify3D) but this will require making the parsing routines more robust (they are lazily written to work with typical Slic3r style output only) and maybe also changes to the logic. Contributions to make the script usable with other slicers are welcome!
 
 ## License
 This script is released under a Creative Commons Attribution 4.0 International license.
+
+Use at your own risk. The author is not responsible for damage to your printer or other accidents due to the use of this script.
