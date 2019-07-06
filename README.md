@@ -13,7 +13,7 @@ This is a Perl script that transforms G-code as produced by PrusaSlicer (Slic3r)
 
 In a nutshell, this script:
 1. maintains a priming/wiping tower behind the printed object,
-2. ensures that the number of tool changes are minimized regardless of how inefficient Slic3r schedules them,
+2. ensures that the number of tool changes are minimized regardless of how inefficiently Slic3r schedules them,
 3. reliably lowers the temperature of the unused nozzle to keep it from oozing (don't try to rely on Slic3r's own ooze prevention, it failed last time I tried it).
 4. does the tool change above the wipe tower and then primes the newly activated nozzle,
 5. wipes the deactivated nozzle on the tower before resuming the print (the wipe position is shuffled to reduce risk of colliding with previous ooze).
@@ -22,11 +22,11 @@ This script is *not* plug-and-play, unless you use the workflow and configuratio
 
 
 ## Installing and using
-Since version 0.6, the script will only work with relative E distances. This must be enabled in your printer profile, which should be the case if you use [my latest configurations and G-code](https://www.thingiverse.com/thing:2367215).
+The script will only work with relative E distances. This must be enabled in your printer profile, which should be the case if you use [my latest configurations and G-code](https://www.thingiverse.com/thing:2367215).
 
-The script looks for specific markers that occur in my own start and tool change G-code snippets, as provided in the above links. You can use the script with your own G-code of course, but you will need to either edit the `MARK` variables to detect your own comment lines in the code, or modify your G-code to include the same markers this function looks for.
+The script looks for specific markers that occur in my own start and tool change G-code snippets, as provided in the above links. You can use the script with your own G-code of course, but you will need to either edit the `MARK` variables to detect your own comment lines in the code, or modify your G-code to include those same markers.
 
-The actual start G-code does not matter because it will be overridden by the script. The only requirements is that it starts with the value of `$MARK_START_CODE_BEGIN`, and ends with a line that ends with “`;@body`”.
+The actual start G-code does not matter because it will be overridden by the script. The only requirements are that it starts with the value of `$MARK_START_CODE_BEGIN`, and ends with a line that ends with “`;@body`”.
 
 ### Deploying the script
 
@@ -46,7 +46,7 @@ It is recommended to enable a tall skirt that reaches at least up to the last la
 
 Currently the script will place the tower behind the print without considering the bed size or trying to shift things around, so make sure there is enough room (at least 22 mm) behind your print before exporting it. This means you won't be able to do huge dual extrusions that take up the entire bed, but the risk of those failing is pretty high anyway.
 
-The bed temperature will be set according to the material in the right extruder, unless there is only material from the left extruder in the first layer, then it will be according to the left extruder material.
+The bed temperature will be set according to the material in the *right* extruder, unless there is only material from the left extruder in the first layer, then it will be according to the left extruder material. What this means in practice, is that when you are printing with materials that have different optimal bed temperatures, ideally the right extruder should be loaded with the filament that extrudes the most material in the first layer.
 
 So far I have only tested this with not very tall prints. I suspect that the wipe/prime tower is likely to be knocked over when printing something very tall. Anything that has 2 materials above 60mm is likely to be risky. Improving wipe tower stability is on my TODO list.
 
