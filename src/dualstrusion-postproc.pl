@@ -923,6 +923,7 @@ sub outputTransformedCode
 {
 	my $codeRef = shift;
 
+	my $fixTravel = 1;
 	foreach my $line (@{$codeRef}) {
 		if($line =~ /^G1 X\S+ Y\S+ E(\S+)($|;.*|\s.*)/) {
 			# Print move: insert unretract if needed
@@ -987,6 +988,13 @@ sub outputTransformedCode
 			$retracted[$activeTool] += $e;
 			$retracted[$activeTool] = 0 if($retracted[$activeTool] > 0);
 			push(@output, sprintf('G1 E%.5f %s', $e, $extra)) if($e);
+		}
+		elsif($fixTravel && $line =~ /^G1 X\S+ Y\S+ *$/) {
+		 	# A recent Slic3r version introduced a rather pointless optimisation that omits travel
+		 	# feedrate if it is the same as in a previous line. Ensure this does not cause the
+		 	# first travel move in this block to have an undefined feedrate.
+			push(@output, "${line} F${travelFeedRate}");
+			$fixTravel = 0;
 		}
 		elsif($line =~ /^M108 T/) {
 			# Drop these to avoid any confusion, our own tool change code will insert this where appropriate
