@@ -290,7 +290,7 @@ foreach my $layerZ (@layerHeights) {
 		my @cleanedFanState;
 		foreach my $blockRef (@blockList) {
 			my $back = -1;
-			# If the final G1 command is a retract move, drop it.
+			# If the final G1 command is a retract move ("G1 E"), drop it.
 			# Limit the search to the last 16 lines.
 			while(@{$blockRef} && $back >= -16) {
 				if($$blockRef[$back] =~ /^G1 +(\S+)/) {
@@ -564,6 +564,7 @@ sub parseInputFile
 	# lines, as well as the previous one
 	my ($toolLayerRef, $previousLayerRef);
 	my $lineNumber = 0;
+	my $snubTCUnretract = 0;
 
 	my ($filaDiamOK, $nozzleDiamOK, $extruMultiOK, $relativeEOK) = (0) x 4;
 
@@ -705,13 +706,21 @@ sub parseInputFile
 		}
 		elsif($line =~ /^\Q${MARK_TOOLCHANGE_END}\E/ ) {
 			$zone = 100;
+			$snubTCUnretract = 1;
 			next;
 		}
-
-		if($line =~ /^T(0|1)/) {  # Tool change
+		elsif($zone == 100 && $line =~ /^G1 E(-?)\d*\.\d+( +F\S+| *;)?/) {
+			# (Un)retract, discard first unretract after tool change because we'll insert our own.
+			$line = ";${line} ; DISABLED original TC unretract" if($snubTCUnretract && !$1);
+			$snubTCUnretract = 0;
+		}
+		elsif($line =~ /^T(\d+)/) {  # Tool change
 			my $previousTool = $activeTool;
 			$activeTool = $1;
-			die "ERROR: more than 2 tools not supported.\n" if($activeTool > 1);
+			if($activeTool > 1) {
+				logMsg($FATAL, 'More than 2 extruders not supported.');
+				exit(1);
+			}
 			if($previousTool == $activeTool) {
 				logMsg($DEBUG,
 				       "ignoring tool change to same tool ${activeTool} at line ${lineNumber}");
@@ -806,18 +815,29 @@ sub parseInputFile
 
 		push(@$toolLayerRef, $line) if($zone != 101); 
 	}
+
+	# Sanity checks
+	if($zone != 4) {
+		logMsg($FATAL, "Not all markers were found, script is stuck in zone ${zone}.");
+		exit(1);
+	}
 	if(!($filaDiamOK && $nozzleDiamOK && $extruMultiOK)) {
 		logMsg($WARNING,
-		       'not all extrusion parameters could be parsed from the file. Extrusion values may be wrong. Check the input file!');
+			'Not all extrusion parameters could be parsed from the file. Extrusion values may be wrong. Check the input file!');
 	}
 	if(!@temperature || $#temperature < 1 || !@first_layer_temperature || $#first_layer_temperature < 1) {
 		logMsg($FATAL,
-		       'could not find "temperature" and/or "first_layer_temperature" values in the file, these are essential to avoid utter and complete b0rk.');
+			'Could not find "temperature" and/or "first_layer_temperature" values in the file, these are essential for correct operation.');
+		exit(1);
+	}
+	if(!@bed_temperature || !@first_layer_bed_temperature) {
+		logMsg($FATAL,
+			'Could not find "bed_temperature" and/or "first_layer_bed_temperature" values in the file, these are essential for correct operation.');
 		exit(1);
 	}
 	if(!$relativeEOK) {
 		logMsg($FATAL,
-		       'The input file does not specify relative E coordinates in its start G-code, this is required for the dualstrusion post-processing script.');
+			'The input file does not specify relative E coordinates in its start G-code, this is required for the dualstrusion post-processing script.');
 		exit(1);
 	}
 
@@ -1119,7 +1139,7 @@ sub generateStartCode
 		# Tool T0 = extruder 1 in PrusaSlicer = right extruder
 
 		$out = <<__END__;
-; Overridden by dualstrusion-postproc.pl v${version} right extruder start G-code
+; Right extruder start G-code overridden by dualstrusion-postproc.pl v${version}
 T0; set primary extruder
 ; We will not prime the left extruder here, that will happen through the priming tower.
 M73 P0; enable show build progress
@@ -1177,7 +1197,7 @@ __END__
 		# Tool T1 = extruder 2 in PrusaSlicer = left extruder
 
 		$out = <<__END__;
-; Overridden by dualstrusion-postproc.pl v${version} left extruder start G-code
+; Left extruder start G-code overridden by dualstrusion-postproc.pl v${version}
 T0; start with the right extruder. We will switch to T1 after having moved the print head to provide enough space for the nozzle offset. T0 will be primed by the priming tower.
 M73 P0; enable show build progress
 M140 S${bedTemp}; heat bed up to first layer temperature
