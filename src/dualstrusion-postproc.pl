@@ -239,8 +239,9 @@ my %toolLayers;
 my %fanState;
 
 # Current speed of the fan in the input or output file. We need to keep track of this because the
-# fan should not be enabled during tool change and priming.
-my $fanSpeed = 0;
+# fan should not be enabled during tool change and priming. Also keep previous speed in case we
+# need to undo an already registered command.
+my ($fanSpeed, $lastFanSpeed) = (0, 0);
 
 my ($minX, $minY, $maxX, $maxY) = parseInputFile($inFile);
 if($logLevel <= $DEBUG) {
@@ -379,7 +380,7 @@ $retracted[$nextTool] = -$retractLen[$nextTool] - $initRetractX;
 # during wiping.
 my @wiping = (0, 0);
 
-$fanSpeed = 0;
+($fanSpeed, $lastFanSpeed) = (0, 0);
 
 push(@start,
 	sprintf('M104 S%d T%d ; heat T%d to standby temperature while T%d starts',
@@ -436,6 +437,7 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 	if($layerZ <= $highestToolChangeZ) {
 		if(!@otherToolBlocks && $toolStillActiveNextLayer && $layerZ < $highestToolChangeZ) {
 			logMsg($DEBUG, '  TOP UP PRIMING TOWER ['. ($hNum+$#output) .']');
+			# Maybe set fan to min_fan_speed when topping up the tower?
 			outputTopUpPrimingTower($isLayer1, $layerThickness[$layerId], $layerZ);
 		}
 		else {
@@ -445,10 +447,15 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 				logMsg($DEBUG, '  AND PRINT '. (1+$#otherToolBlocks) .' BLOCKS ['.
 				       ($hNum+$#output) .']');
 			}
-			# The tool change code will restore $fanSpeed as a final step.
-			$fanSpeed = $otherFanState[0] if(@otherFanState);
+
+			# Tool change code disables the fan. Any fan speed command at the end of current
+			# output is therefore useless, disable it.
+			pruneFanCommand();
+			# At the end of the tool change, set fan speed to that of the next block.
+			my $nextFanSpeed = @otherFanState ? $otherFanState[0] : $fanSpeed;
+
 			push(@output, doRetractMove(-$retractLenTC[$activeTool]) .' ; tool change retract');
-			outputToolChangeAndPrime($isLayer1, $layerThickness[$layerId], $layerZ);
+			outputToolChangeAndPrime($isLayer1, $layerThickness[$layerId], $layerZ, $nextFanSpeed);
 			for(my $i=0; $i<=$#otherToolBlocks; $i++) {
 				ensureFanSpeed($otherFanState[$i]) if($i > 0);
 				outputTransformedCode($otherToolBlocks[$i]);
@@ -507,31 +514,36 @@ sub updateFanSpeed
 	if($line =~ /^M126(?:$|\s|;)/) {
 		if($variableFan) {
 			logMsg($WARNING,
-				   'found an M126 command even though the file uses M106/127 commands. Ignoring.');
+				   'found an M126 command even though the file uses M106/107 commands. Ignoring.');
 		}
 		else {
+			$lastFanSpeed = $fanSpeed;
 			$fanSpeed = 1;
 		}
 	}
 	elsif($line =~ /^M127(?:$|\s|;)/) {
 		if($variableFan) {
 			logMsg($WARNING,
-				   'found an M127 command even though the file uses M106/127 commands. Ignoring.');
+				   'found an M127 command even though the file uses M106/107 commands. Ignoring.');
 		}
 		else {
+			$lastFanSpeed = $fanSpeed;
 			$fanSpeed = 0;
 		}
 	}
 	elsif($line =~ /^M106(?:$|;|\s+S(\d*\.?\d+)|\s)/) {
+		$lastFanSpeed = $fanSpeed;
 		$fanSpeed = $1 ? $1 : 0;
 	}
 	elsif($line =~ /^M107(?:$|\s|;)/) {
+		$lastFanSpeed = $fanSpeed;
 		$fanSpeed = 0;
 	}
 }
 
 sub ensureFanSpeed
 # If current $fanSpeed differs from target, add a G-code line to @output and update $fanSpeed.
+# Never inject M106/126/... commands directly, always use this method.
 {
 	my $target = shift;
 	my $comment = shift;
@@ -540,12 +552,30 @@ sub ensureFanSpeed
 	return if($fanSpeed == $target);
 
 	if($variableFan) {
-		push(@output, sprintf("M106 S%0.2f${comment}", $target));
+		my $val = ($target == 0 ? 0 : sprintf('%0.2f', $target));
+		push(@output, "M106 S${val}${comment}");
 	}
 	else {
 		push(@output, ($target ? 'M126' : 'M127') . ${comment});
 	}
+	$lastFanSpeed = $fanSpeed;
 	$fanSpeed = $target;
+}
+
+sub pruneFanCommand
+# If the last non-commented line in @output is a fan speed command, disable it.
+# $fanSpeed will be restored to the value before the now disabled command was seen or inserted.
+{
+	# Since we ignore M12[67] in updateFanSpeed if variableFan, also do it here
+	my $re = $variableFan ? qr/M10[67]/ : qr/M12[67]/;
+	for(my $i = $#output; $i > -1; $i--) {
+		if($output[$i] =~ /^$re/) {
+			$output[$i] = ';'. $output[$i] .' ; DISABLED, reinserted at correct place';
+			$fanSpeed = $lastFanSpeed;
+			return;
+		}
+		return if($output[$i] !~ /^\s*(;.*)?$/);
+	}
 }
 
 sub parseInputFile
@@ -1010,7 +1040,7 @@ sub outputTransformedCode
 sub outputToolChangeAndPrime
 # Appends commands to @output to perform the tool change and prime the new nozzle.
 {
-	my ($isLayer1, $thickness, $layerZ) = @_;
+	my ($isLayer1, $thickness, $layerZ, $newFanSpeed) = @_;
 
 	my $nextTool = otherT($activeTool);
 	$wipeOffset = ($wipeOffset + 1) % 3;
@@ -1038,7 +1068,7 @@ sub outputToolChangeAndPrime
 	push(@output, sprintf('G1 X%.3f Y%.3f F%d', $squareX, $squareY + $yOffset, $travelFeedRate));
 	push(@output, sprintf('G1 Z%.3f F%d', $layerZ, $travelFeedRate)) if($doLift);
 
-	push(@output, 'M106 S0; disable fan') if($variableFan && $fanSpeed);
+	ensureFanSpeed(0, 'disable fan') if($variableFan);  # Why the distinction: see comment below.
 
 	# Do the tool swap. Use workaround to do the move at a reasonable speed, because it is not accelerated.
 	# TODO: I could parse the original tool change code from the file, and fill in the template.
@@ -1049,12 +1079,11 @@ sub outputToolChangeAndPrime
 	               "T${activeTool}; do actual tool swap",
 	               "M108 T${activeTool}",
 	               'G4 P0; flush pipeline'));
-	if(! $variableFan && $fanSpeed) {
-		# Only disable the fan now, because Sailfish has the stupid habit of anticipating M12[67]
-		# commands for several seconds and possibly already disabling the fan while we might still
-		# be printing a difficult overhang.
-		push(@output, 'M127; disable fan');
-	}
+	# Only disable the fan now, because Sailfish has the stupid habit of anticipating M12[67]
+	# commands for several seconds and possibly already disabling the fan while we might still
+	# be printing a difficult overhang.
+	ensureFanSpeed(0, 'disable fan') if(! $variableFan);
+
 	# Only wait for the active nozzle to heat. The inactive nozzle should have cooled down enough
 	# by that time that it will no longer ooze. It is actually better not to wait until it has
 	# cooled down entirely, or the wipe may not be successful.
@@ -1075,17 +1104,10 @@ sub outputToolChangeAndPrime
 	# Wipe the ooze from the deactivated nozzle.
 	push(@output, sprintf('G1 X%.3f Y%.3f F%d', $squareX, $squareY + $yOffset, $travelFeedRate));
 
-	if($fanSpeed) {
-		if($variableFan) {
-			push(@output, sprintf('M106 S%0.2f; re-enable fan', $fanSpeed));
-		}
-		else {
-			# Again, the fan would enable way earlier than I would like it to, therefore block it
-			# with a pipeline flush. Enable the fan before the wipe move, so it has some time to
-			# spin up.
-			push(@output, ('G4 P0', 'M126; re-enable fan'));
-		}
-	}
+	# Again, M126 would enable the fan way earlier than I would like it to, therefore block it
+	# with a pipeline flush. Enable the fan before the wipe move, so it has some time to spin up.
+	push(@output, 'G4 P0') if(!$variableFan && $newFanSpeed);
+	ensureFanSpeed($newFanSpeed, '(re-)enable fan');
 
 	my $move = $nozzleDistance;
 	$move *= -1 if($activeTool == 1);
