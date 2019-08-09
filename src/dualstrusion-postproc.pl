@@ -848,7 +848,7 @@ sub parseInputFile
 
 	# Sanity checks
 	if($zone != 4) {
-		logMsg($FATAL, "Not all markers were found, script is stuck in zone ${zone}.");
+		logMsg($FATAL, "Not all markers were found, script is stuck in zone ${zone}. Make sure you are using the correct G-code snippets for dual extrusion.");
 		exit(1);
 	}
 	if(!($filaDiamOK && $nozzleDiamOK && $extruMultiOK)) {
