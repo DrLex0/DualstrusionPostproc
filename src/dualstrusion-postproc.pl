@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 # Dualstrusion post-processing script for PrusaSlicer output and a Replicator Dual-like printer.
-# Version: 1.0
+# Version: 1.1a
 # Alexander Thomas a.k.a. DrLex, https://www.dr-lex.be/
 # GitHub project: https://github.com/DrLex0/DualstrusionPostproc
 # Released under Creative Commons Attribution 4.0 International license.
@@ -84,6 +84,12 @@ my $initRetractX = 0.6;
 # ooze as well as the next priming layer.
 my $maintainVLine = 1;
 
+# Set to 1 to heat the other extruder to its standby temperature as soon as the first extruder
+# starts printing, instead of leaving it at the temperature set in the start G-code (by default
+# 140 degC). This shortens the time needed for the first tool change, but it incurs a risk of
+# ooze if the extruder was not previously retracted.
+my $preheatOtherTool = 0;
+
 # Markers for begin and/or end of G-code chunks as configured in PrusaSlicer.
 # The lines must start exactly like this, but can end with anything.
 my $MARK_START_CODE_BEGIN = ';- - - Custom G-code for dual extruder printing';
@@ -94,7 +100,7 @@ my $MARK_TOOLCHANGE_END   = ';- - - End custom G-code for tool change';
 
 #### The variables below should normally not be modified. ####
 
-my $version = '1.0';
+my $version = '1.1a';
 
 # The factor between mm/s values as used by Slic3r, and the feed rates as specified in the G-code.
 my $feedRateMultiplier = 60; 
@@ -382,9 +388,11 @@ my @wiping = (0, 0);
 
 ($fanSpeed, $lastFanSpeed) = (0, 0);
 
-push(@start,
-	sprintf('M104 S%d T%d ; heat T%d to standby temperature while T%d starts',
-	        $temperature[$nextTool] - $temperatureDrop, $nextTool, $nextTool, $startTool));
+if($preheatOtherTool) {
+	push(@start,
+		sprintf('M104 S%d T%d ; heat T%d to standby temperature while T%d starts',
+		        $temperature[$nextTool] - $temperatureDrop, $nextTool, $nextTool, $startTool));
+}
 my $hNum = 1+$#header;
 
 # Reassemble the file in optimal order and insert retractions and priming code where necessary.
