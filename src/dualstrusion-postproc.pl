@@ -33,6 +33,10 @@
 #   changes. You should enable 'Synchronize with object layers' in Slic3r.
 # Lift Z is now supported. Be sure to use it for inlays (coasters etc.), otherwise travel moves
 #   from the second color printed in the same layer risk smudging the first color.
+# NOTE: filament-specific start and end G-code is not supported. Any such code as inserted by
+#       PrusaSlicer will be preserved, but may end up not where you expect it. A small number of
+#       comment lines (less than 10) in this code is OK.
+#       (TODO: special comments in filament G-code could override $temperatureDrop per filament.)
 #
 # TODOs: 1. make the priming tower more stable at tall heights, either rotate it 45° or make it
 #           more circular, or maybe make the base wider.
@@ -272,6 +276,8 @@ if(!@layerHeights) {
 # Preprocess the code blocks: wipe any retract command at the very end, because we'll be replacing
 # these with our own retracts. (Moreover, Slic3r first changes layer and then retracts, so there
 # will be blocks that only have a retract in them.)
+# Also move code from layer N+1 to layer N if it does not perform any print moves. Otherwise
+# comments and other junk could prevent optimisation of tool changes.
 my $lastLayerZ = $layerHeights[-1];
 my $previousLayerZ = 0;
 my $layerId = 0;
@@ -295,17 +301,30 @@ foreach my $layerZ (@layerHeights) {
 
 		my @cleanedBlocks;
 		my @cleanedFanState;
+		my $hasMove = 0;  # Whether $toolLayers{$key} may contain moves besides a final retract
 		foreach my $blockRef (@blockList) {
 			my $back = -1;
 			# If the final G1 command is a retract move ("G1 E"), drop it.
-			# Limit the search to the last 16 lines.
-			while(@{$blockRef} && $back >= -16) {
+			# Also detect non-retract moves.
+			# To keep this efficient, limit search to the last 16 lines: assume any block longer
+			# than this will have moves and will not end in a retract.
+			while(@{$blockRef} && $back >= -@$blockRef && $back >= -16) {
 				if($$blockRef[$back] =~ /^G1 +(\S+)/) {
-					splice(@{$blockRef}, $back, 1) if($1 =~ /^E/);
-					last;
+					if($1 =~ /^E/){
+						splice(@{$blockRef}, $back, 1);
+						# This will keep dropping retracts if the block ends with some weird dance
+						# of multiple retracts with no other moves in between. Assume this will
+						# never happen.
+					}
+					else {
+						$hasMove = 1;
+						last;
+					}
 				}
-				$back--;
-				last if(-$back > @$blockRef);
+				else {
+					$back--;
+				}
+				$hasMove = 1 if($back == -16 && @$blockRef > 16);
 			}
 			my $fan = shift(@fanList);
 			if(@{$blockRef}) {
@@ -313,9 +332,25 @@ foreach my $layerZ (@layerHeights) {
 				push(@cleanedFanState, $fan);
 			}
 		}
+
 		if(@cleanedBlocks) {
-			$toolLayers{$key} = \@cleanedBlocks;
-			$fanState{$key} = \@cleanedFanState;
+			if($hasMove || $layerId == 0) {
+				$toolLayers{$key} = \@cleanedBlocks;
+				$fanState{$key} = \@cleanedFanState;
+			}
+			else {
+				my $prevKey = "${tool}_${previousLayerZ}";
+				if(! $toolLayers{$prevKey}) {
+					# This should not happen in any sane G-code file
+					logMsg($DEBUG, "Unexpected lack of blocks in ${prevKey}!");
+					$toolLayers{$prevKey} = [];
+					$fanState{$prevKey} = [];
+				}
+				push(@{$toolLayers{$prevKey}}, @cleanedBlocks);
+				push(@{$fanState{$prevKey}}, @cleanedFanState);
+				delete $toolLayers{$key};
+				delete $fanState{$key};
+			}
 		}
 		else {
 			delete $toolLayers{$key};
