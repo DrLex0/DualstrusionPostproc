@@ -23,7 +23,7 @@
 # needs to reach up to the last layer that has two materials.
 #
 # This script assumes you are using the custom G-code I published at
-#    https://www.dr-lex.be/info-stuff/print3d-ffcp.html#slice_gcode
+#    https://www.dr-lex.be/software/ffcp-slic3r-profiles.html
 #    or https://www.thingiverse.com/thing:2367350
 # You can adapt it to your own G-code snippets by modifying the MARK variables.
 # This version of the script MUST be used with the latest printer profiles and snippets that

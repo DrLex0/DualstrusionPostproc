@@ -18,7 +18,7 @@ In a nutshell, this script:
 4. does the tool change above the wipe tower and then primes the newly activated nozzle,
 5. wipes the deactivated nozzle on the tower before resuming the print (the wipe position is shuffled to reduce risk of colliding with previous ooze).
 
-This script is *not* plug-and-play, unless you use the workflow and configuration files as described on <https://www.dr-lex.be/info-stuff/print3d-ffcp.html> and <https://www.thingiverse.com/thing:2367215>
+This script is *not* plug-and-play, unless you use the workflow and configuration files as described on <https://www.dr-lex.be/software/ffcp-slic3r-profiles.html> and <https://www.thingiverse.com/thing:2367215>
 
 
 ## Installing and using
@@ -36,7 +36,7 @@ Then, either:
   `./dualstrusion-postproc.pl input.gcode > output.gcode`
 * or, use a wrapper script that does the above and configure that wrapper script in each of your Print Settings in Slic3r (*Output options* → *Post-processing scripts*).
 
-If you use [my PrusaSlicer configs and workflow](https://www.thingiverse.com/thing:2367215) with the `make_fcp_x3g` wrapper script, first make sure you have set up the configs and that script according to their [instructions](https://www.dr-lex.be/info-stuff/print3d-ffcp.html#slice_config). Then, open the `make_fcp_x3g` script in an editor of your choice and uncomment the line starting with `DUALSTRUDE_SCRIPT`. Set its value to the full path of the `dualstrusion-postproc.pl` file inside your Linux or OS X environment.
+If you use [my PrusaSlicer configs and workflow](https://www.thingiverse.com/thing:2367215) with the `make_fcp_x3g` wrapper script, first make sure you have set up the configs and that script according to their [instructions](https://www.dr-lex.be/software/ffcp-slic3r-profiles.html#config). Then, open the `make_fcp_x3g` script in an editor of your choice and uncomment the line starting with `DUALSTRUDE_SCRIPT`. Set its value to the full path of the `dualstrusion-postproc.pl` file inside your Linux or OS X environment.
 
 You can configure the `make_fcp_x3g` script to keep a copy of the unprocessed code as a copy with “`_orig`” appended to the name. This allows to manually run the script again with different settings in case you want to change something without re-exporting the G-code file from Slic3r.
 
