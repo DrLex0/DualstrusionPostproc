@@ -7,7 +7,7 @@ Contact: visit <https://www.dr-lex.be/lexmail.html><br>
 
 
 ## What is it?
-See <https://www.dr-lex.be/info-stuff/print3d-dualstrusion.html> for more information.
+See <https://www.dr-lex.be/software/print3d-dualstrusion.html> for more information.
 
 This is a Perl script that transforms G-code as produced by PrusaSlicer (Slic3r) into more optimal code for creating high-quality dual extrusion prints with printers similar to the FlashForge Creator Pro (running Sailfish firmware), which have two extruders on a single carriage. It avoids that the deactivated nozzle oozes across the print, and it primes the active extruder before resuming printing.
 
