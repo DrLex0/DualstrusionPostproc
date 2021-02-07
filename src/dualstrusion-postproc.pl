@@ -1,6 +1,5 @@
 #!/usr/bin/perl
 # Dualstrusion post-processing script for PrusaSlicer output and a Replicator Dual-like printer.
-# Version: 1.1a
 # Alexander Thomas a.k.a. DrLex, https://www.dr-lex.be/
 # GitHub project: https://github.com/DrLex0/DualstrusionPostproc
 # Released under Creative Commons Attribution 4.0 International license.
@@ -24,7 +23,7 @@
 #
 # This script assumes you are using the custom G-code I published at
 #    https://www.dr-lex.be/software/ffcp-slic3r-profiles.html
-#    or https://www.thingiverse.com/thing:2367350
+#    or https://github.com/DrLex0/DualstrusionPostproc
 # You can adapt it to your own G-code snippets by modifying the MARK variables.
 # This version of the script MUST be used with the latest printer profiles and snippets that
 #   use relative E distances! It will exit with an error if this condition is not met.
@@ -51,6 +50,9 @@
 
 use strict;
 use warnings;
+use File::Basename;
+use Getopt::Std;
+
 
 #### Configurable options ####
 
@@ -102,9 +104,27 @@ my $MARK_TOOLCHANGE_BEGIN = ';- - - Custom G-code for tool change';
 my $MARK_TOOLCHANGE_END   = ';- - - End custom G-code for tool change';
 
 
-#### The variables below should normally not be modified. ####
+############## No user serviceable parts below ###############
 
-my $version = '1.1a';
+our $VERSION = '1.1';
+
+sub HELP_MESSAGE
+{
+	my $prog = basename($0);
+	print <<__END__;
+Usage: ${prog} [-d] input.gcode > output.gcode
+   or: ${prog} [-d] -o output.gcode input.gcode
+Processes dual extrusion G-code to produce better results on printers with
+  two extruders on a single carriage, like the Flashforge Creator Pro.
+Options:
+  -d: debug mode, prints verbose log messages on stderr.
+  -o FILE: write output to FILE instead of stdout.
+Never use the same file for both inputFile and output!
+__END__
+}
+
+
+#### The variables below should normally not be modified. ####
 
 # The factor between mm/s values as used by Slic3r, and the feed rates as specified in the G-code.
 my $feedRateMultiplier = 60; 
@@ -223,13 +243,22 @@ my %logLevelNames = (10 => 'DEBUG', 20 => 'INFO', 30 => 'WARNING', 40 => 'ERROR'
 
 my $logLevel = $INFO;
 
-if($ARGV[0] eq '-d') {
-	$logLevel = $DEBUG;
-	shift;
+$Getopt::Std::STANDARD_HELP_VERSION = 1;
+my %opts;
+exit 2 if(! getopts('hdo:', \%opts));
+
+if($opts{'h'}) {
+	HELP_MESSAGE();
+	exit;
 }
+$logLevel = $DEBUG if($opts{'d'});
 
 my $inFile = shift;
-die "Need input file as argument!\n" if(!$inFile);
+die "ERROR: need input file as argument!\n" if(!$inFile);
+if(defined $opts{'o'} && $opts{'o'} ne '') {
+	die "ERROR: output file cannot be the same as input file\n" if($opts{'o'} eq $inFile);
+}
+
 
 my $variableFan = 0;  # If true, use M106/107 commands, otherwise M126/127
 my @extruScale = (1, 1);
@@ -524,13 +553,20 @@ for(my $layerId = 0; $layerId <= $#layerHeights; $layerId++) {
 push(@output, doRetractMove(-$retractLen[$activeTool]) .' ; end of print retract') if(! $retracted[$activeTool]);
 ensureFanSpeed(0, '; end of print fan off');
 
-print join("\n",
+my $outHandle = \*STDOUT;
+my $outFileHandle;
+if(defined $opts{'o'} && $opts{'o'} ne '') {
+	open($outFileHandle, '>', $opts{'o'}) or die "ERROR: cannot write to '$opts{o}': $!\n";
+	$outHandle = $outFileHandle;
+}
+
+print $outHandle join("\n",
 	@header,
 	generateStartCode($startTool, $bed_material),
 	@start,
 	@output,
 	@footer) ."\n";
-
+close($outFileHandle) if($outFileHandle);
 
 
 ###### SUBROUTINES ######
@@ -627,7 +663,7 @@ sub parseInputFile
 # Requires @header, @start, @footer, @layerHeights, %toolLayers, and %fanState to be declared.
 {
 	my $fName = shift;
-	open(my $fHandle, '<', $fName) or die "FAIL: cannot read file: $!";
+	open(my $fHandle, '<', $fName) or die "FAIL: cannot read file '${fName}': $!";
 
 	my ($currentZ, $layerNumber, $activeTool) = (0) x 3;
 	# This code will fail for printers with a print bed larger than 65 metres. Too bad.
@@ -891,7 +927,7 @@ sub parseInputFile
 
 	# Sanity checks
 	if($zone != 4) {
-		logMsg($FATAL, "Not all markers were found, script is stuck in zone ${zone}. Make sure you are using the correct G-code snippets for dual extrusion.");
+		logMsg($FATAL, "Not all markers were found, script is stuck in zone ${zone}. Make sure you are using the correct G-code snippets for dual extrusion and the input file is a dual extrusion print.");
 		exit(1);
 	}
 	if(!($filaDiamOK && $nozzleDiamOK && $extruMultiOK)) {
@@ -1212,7 +1248,7 @@ sub generateStartCode
 		# Tool T0 = extruder 1 in PrusaSlicer = right extruder
 
 		$out = <<__END__;
-; Right extruder start G-code overridden by dualstrusion-postproc.pl v${version}
+; Right extruder start G-code overridden by dualstrusion-postproc.pl v${VERSION}
 T0; set primary extruder
 ; We will not prime the left extruder here, that will happen through the priming tower.
 M73 P0; enable show build progress
@@ -1270,7 +1306,7 @@ __END__
 		# Tool T1 = extruder 2 in PrusaSlicer = left extruder
 
 		$out = <<__END__;
-; Left extruder start G-code overridden by dualstrusion-postproc.pl v${version}
+; Left extruder start G-code overridden by dualstrusion-postproc.pl v${VERSION}
 T0; start with the right extruder. We will switch to T1 after having moved the print head to provide enough space for the nozzle offset. T0 will be primed by the priming tower.
 M73 P0; enable show build progress
 M140 S${bedTemp}; heat bed up to first layer temperature
