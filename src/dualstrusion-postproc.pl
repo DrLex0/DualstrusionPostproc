@@ -106,7 +106,7 @@ my $MARK_TOOLCHANGE_END   = ';- - - End custom G-code for tool change';
 
 ############## No user serviceable parts below ###############
 
-our $VERSION = '1.1';
+our $VERSION = '1.2a';
 
 sub HELP_MESSAGE
 {
@@ -673,6 +673,8 @@ sub parseInputFile
 	# lines, as well as the previous one
 	my ($toolLayerRef, $previousLayerRef);
 	my $lineNumber = 0;
+	# If true, it means we just finished the tool change and want to suppress the next retract
+	# move if it is an unretract.
 	my $snubTCUnretract = 0;
 
 	my ($filaDiamOK, $nozzleDiamOK, $extruMultiOK, $relativeEOK) = (0) x 4;
@@ -818,8 +820,9 @@ sub parseInputFile
 			$snubTCUnretract = 1;
 			next;
 		}
-		elsif($zone == 100 && $line =~ /^G1 E(-?)\d*\.\d+( +F\S+| *;)?/) {
+		elsif($zone == 100 && $line =~ /^G1 E(-?)\d*\.?\d+( +F\S+| *;)?/) {
 			# (Un)retract, discard first unretract after tool change because we'll insert our own.
+			# $1 will contain '-' if it's a retract, and be null for an unretract.
 			$line = ";${line} ; DISABLED original TC unretract" if($snubTCUnretract && !$1);
 			$snubTCUnretract = 0;
 		}
